@@ -32,6 +32,9 @@
 #include "ns3/data-rate.h"
 #include "ns3/node.h"
 #include "ns3/tcp-socket-state.h"
+#include "ns3/selective-packet-queue.h"
+#include "ns3/tcp-flow-id-tag.h"
+#include <vector>
 
 namespace ns3 {
 
@@ -486,9 +489,22 @@ public:
   typedef enum
     {
       NoEcn = 0,   //!< ECN is not enabled.
-      ClassicEcn   //!< ECN functionality as described in RFC 3168.
+      ClassicEcn,   //!< ECN functionality as described in RFC 3168.
+      DCTCP
     } EcnMode_t;
 
+
+  /**
+   * \brief TLT States
+   */
+  typedef enum
+    {
+      ImpIdle = 0,
+      ImpPendingNormal,
+      ImpPendingForce,
+      ImpPendingInitialWindow,
+      ImpScheduled
+    } TltState_t;
   /**
    * \brief Checks if TOS has no ECN bits
    *
@@ -742,17 +758,20 @@ protected:
    * \returns the number of bytes sent
    */
   virtual uint32_t SendDataPacket (SequenceNumber32 seq, uint32_t maxSize, bool withAck);
+  virtual uint32_t SendDataPacket (SequenceNumber32 seq, uint32_t maxSize, bool withAck, bool fastRetx, bool tltForceRetransmit);
 
   /**
    * \brief Send a empty packet that carries a flag, e.g., ACK
    *
    * \param flags the packet's flags
    */
+  public:
   virtual void SendEmptyPacket (uint8_t flags);
 
   /**
    * \brief Send reset and tear down this socket
    */
+  protected:
   void SendRST (void);
 
   /**
@@ -964,10 +983,11 @@ protected:
    * \param ackNumber ack number
    * \param scoreboardUpdated if true indicates that the scoreboard has been
    * \param oldHeadSequence value of HeadSequence before ack
+   * \param withECE 
    * updated with SACK information
    */
   virtual void ProcessAck (const SequenceNumber32 &ackNumber, bool scoreboardUpdated,
-                           const SequenceNumber32 &oldHeadSequence);
+                           const SequenceNumber32 &oldHeadSequence, bool withECE);
 
   /**
    * \brief Recv of a data, put into buffer, call L7 to get it if necessary
@@ -1035,6 +1055,7 @@ protected:
    * available window nor pacing.
    */
   void DoRetransmit (void);
+  void DoRetransmit (bool fastRetx);
 
   /** \brief Add options to TcpHeader
    *
@@ -1168,6 +1189,8 @@ protected:
    */
   void AddSocketTags (const Ptr<Packet> &p) const;
 
+  void SchedulePto (uint32_t remainingData);
+  void PtoTimeout (void);
 protected:
   // Counters and events
   EventId           m_retxEvent     {}; //!< Retransmission event
@@ -1193,7 +1216,7 @@ protected:
   // Timeouts
   TracedValue<Time> m_rto     {Seconds (0.0)}; //!< Retransmit timeout
   Time              m_minRto  {Time::Max ()};   //!< minimum value of the Retransmit timeout
-  Time              m_clockGranularity {Seconds (0.001)}; //!< Clock Granularity used in RTO calcs
+  Time              m_clockGranularity {MicroSeconds (0.001)}; //!< Clock Granularity used in RTO calcs
   Time              m_delAckTimeout    {Seconds (0.0)};   //!< Time to delay an ACK
   Time              m_persistTimeout   {Seconds (0.0)};   //!< Time between sending 1-byte probes
   Time              m_cnTimeout        {Seconds (0.0)};   //!< Timeout for connection retry
@@ -1272,6 +1295,61 @@ protected:
   TracedValue<SequenceNumber32> m_ecnEchoSeq {0};      //!< Sequence number of the last received ECN Echo
   TracedValue<SequenceNumber32> m_ecnCESeq   {0};      //!< Sequence number of the last received Congestion Experienced
   TracedValue<SequenceNumber32> m_ecnCWRSeq  {0};      //!< Sequence number of the last sent CWR
+
+  // DCTCP related params
+  //bool                    m_DCTCP {false};      //< Socket DCTCP capability -> Replaced to m_ecnMode = EcnMode_t::DCTCP
+  double                  m_g {1.0 / 32.0};
+  bool                    m_EcnTransition; //< flag for determing should we start new Delayed Ack count
+
+  bool m_use_static_rto {false};
+
+  // TLT related params
+  void initTLT();
+  bool forceSendTLT();
+  bool forceSendTLT(uint32_t *pSize, uint32_t tlt_send_unit);
+  bool m_TLT {false};
+  uint32_t m_opt {false};
+  TltState_t m_PendingImportant {ImpPendingInitialWindow};
+  TltState_t m_PendingImportantEcho {ImpIdle};
+  SequenceNumber32 m_tlt_last_seq {0};
+  uint32_t m_tlt_last_sz {0};
+  SelectivePacketQueue m_tlt_unimportant_pkts;
+  Ptr<SelectivePacketQueue> m_tlt_unimportant_pkts_current_round;
+  Ptr<SelectivePacketQueue> m_tlt_unimportant_pkts_prev_round;
+  bool m_tlt_unimportant_flag_debug{false};
+  std::pair<SequenceNumber32, uint32_t> m_tlt_unimportant_pkts_fb {std::pair<SequenceNumber32, uint32_t>(SequenceNumber32(0), 0)};
+  uint64_t stat_uimp_forcegen {0};
+  uint64_t stat_uimp_forcegen_cnt {0};
+  uint64_t txTotalPkts {0};
+  uint64_t txTotalBytes {0};
+  uint64_t txTotalBytesImp {0};
+  uint64_t txTotalBytesUimp {0};
+  uint64_t rtoPerFlow {0};
+  Time m_flowStartTime {0};
+  uint32_t m_tlt_send_unit {1};
+  int32_t socket_rcv_id {-1};
+  SequenceNumber32 m_highestImportantAck {SequenceNumber32(0)};
+
+  bool m_tlp_enabled {false};
+  Time m_tlp_pto {MilliSeconds(4)};
+  int m_tlp_pto_cnt {0};
+  EventId m_tlp_ptoEvent {};
+  SequenceNumber32 m_lastTxSeq {0};
+  uint32_t m_lastTxSz{0};
+  std::vector<Time> stat_xmit;
+  std::vector<Time> stat_ack;
+  uint32_t stat_ack_highest;
+
+  bool m_stat_rto_measure {false};
+  bool m_stat_rto_burst_measure {true};
+  Time m_prev_m{Time(0.0)};
+  Time m_stat_max_rto_burst{Time(0.0)};
+public:
+  TcpFlowIdTag m_recent_tft;
+  bool experienced_tlt_loss_masking{false};
+
+ public:
+  // std::deque<std::pair<Time, std::pair<Time, Time>>> m_stat_rto_time; // simulator_time, measured_rtt, calculated_rto
 };
 
 /**

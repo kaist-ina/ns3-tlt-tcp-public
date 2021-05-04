@@ -377,9 +377,9 @@ protected:
    */
   void DropAfterDequeue (Ptr<Item> item);
 
+  NS_LOG_TEMPLATE_DECLARE;                  //!< the log component
 private:
   std::list<Ptr<Item> > m_packets;          //!< the items in the queue
-  NS_LOG_TEMPLATE_DECLARE;                  //!< the log component
 
   /// Traced callback: fired when a packet is enqueued
   TracedCallback<Ptr<const Item> > m_traceEnqueue;

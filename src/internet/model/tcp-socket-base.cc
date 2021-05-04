@@ -58,16 +58,87 @@
 #include "tcp-option-sack.h"
 #include "tcp-congestion-ops.h"
 #include "tcp-recovery-ops.h"
-
+#include "tlt-tag.h"
+#include "ipv4-ecn-tag.h"
 #include <math.h>
 #include <algorithm>
+#include <execinfo.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include "ns3/pfc-experience-tag.h"
+#include "ns3/tcp-flow-id-tag.h"
+#include <unordered_map>
+#define DEBUG_PRINT 0
 
+#define OPTIMIZE_LEVEL(x) ((m_opt & (1 << ((x)-1))))
+/** Optimization
+ * 1. 1-byte
+ * 2. Last-byte optimization
+ * 6. Prevent duplicate ack (introduce special important echo bit)
+ * 7. Force Retransmission Packet Len (Slow Start approach : 1-2-3-6-11-22-45-90-180-360-720-1440)
+ * 8. Force Retransmission Packet Len (State-Aware approach)
+ * 9. Force Retransmission Patch
+ * 10. Force Retransmission Packet Len (1-byte approach)
+ * 11. Revised Force Retransmission Byte size selection
+ * 12. Actiually Not opt, force retxsegsize to 1MTU
+ * 13. Actiually Not opt, force retxsegsize to 1Byte
+ * 
+ */
 namespace ns3 {
 
-NS_LOG_COMPONENT_DEFINE ("TcpSocketBase");
+static uint64_t reTxTimeoutCnt = 0;
+static uint64_t statImpDataTcp [5] = {0,}; //"CA_OPEN", "CA_DISORDER", "CA_CWR", "CA_RECOVERY", "CA_LOSS"
+static uint64_t statUimpDataTcp [5] = {0,}; //"CA_OPEN", "CA_DISORDER", "CA_CWR", "CA_RECOVERY", "CA_LOSS"
+static uint64_t rxTotalBytes = 0;
+static uint64_t numExperienceLossMasking = 0;
+
+static bool stat_print = true;
+static int m_stat_rto_measure_remainder = 1000000;
+// static double max_rto_burst = 0;
+// static TcpSocketBase *max_rto_burst_item = nullptr;
+// static unsigned int max_rtt_measure = 0;
+// static TcpSocketBase *max_rtt_measure_item = nullptr;
+// static std::unordered_map<TcpSocketBase *, std::pair<double, unsigned int>> stat_max_rtt_record; // TcpSocketBase* -> (maxRto, itmcnt)
+#define CDF_MAX 10000000 //us
+#define CDF_GRAN 5 //us
+#define CDF_RATIO_MAX 1000
+#define CDF_RATIO_GRAN 1000 //ticks
+static unsigned *cdf_rtt_bg = nullptr;
+static unsigned *cdf_rto_bg = nullptr;
+static unsigned *cdf_rtoperrtt_bg = nullptr;
+static unsigned *cdf_rtt_fg = nullptr;
+static unsigned *cdf_rto_fg = nullptr;
+static unsigned *cdf_rtoperrtt_fg = nullptr;
+bool cdf_init = false;
+
+char *argv1;
+NS_LOG_COMPONENT_DEFINE("TcpSocketBase");
 
 NS_OBJECT_ENSURE_REGISTERED (TcpSocketBase);
 
+
+static void embed_tft(TcpSocketBase *tsb, Ptr<Packet> p) {
+  {
+    NS_UNUSED(m_stat_rto_measure_remainder);
+    TcpFlowIdTag tft;
+    if (!p->PeekPacketTag(tft))
+    {
+
+      if(tsb->socketId >= 0) {
+        tft.m_socketId = tsb->socketId;
+        p->AddPacketTag(tft);
+      } else {
+        if(tsb->m_recent_tft.m_socketId >= 0) {
+          p->AddPacketTag(tsb->m_recent_tft);
+        } else  {
+          // std::cerr << "Neither I or remote does not have enough flow info" << std::endl;
+          // abort();
+          p->AddPacketTag(tsb->m_recent_tft);
+        }
+      }
+    }
+  }
+}
 TypeId
 TcpSocketBase::GetTypeId (void)
 {
@@ -111,7 +182,7 @@ TcpSocketBase::GetTypeId (void)
                    MakeBooleanChecker ())
     .AddAttribute ("MinRto",
                    "Minimum retransmit timeout value",
-                   TimeValue (Seconds (1.0)), // RFC 6298 says min RTO=1 sec, but Linux uses 200ms.
+                   TimeValue (Seconds (1)), // RFC 6298 says min RTO=1 sec, but Linux uses 200ms.
                    // See http://www.postel.org/pipermail/end2end-interest/2004-November/004402.html
                    MakeTimeAccessor (&TcpSocketBase::SetMinRto,
                                      &TcpSocketBase::GetMinRto),
@@ -142,10 +213,32 @@ TcpSocketBase::GetTypeId (void)
                    MakeBooleanAccessor (&TcpSocketBase::m_limitedTx),
                    MakeBooleanChecker ())
     .AddAttribute ("EcnMode", "Determines the mode of ECN",
-                   EnumValue (EcnMode_t::NoEcn),
+                   EnumValue (EcnMode_t::ClassicEcn),
                    MakeEnumAccessor (&TcpSocketBase::m_ecnMode),
                    MakeEnumChecker (EcnMode_t::NoEcn, "NoEcn",
-                                    EcnMode_t::ClassicEcn, "ClassicEcn"))
+                                    EcnMode_t::ClassicEcn, "ClassicEcn",
+                                    EcnMode_t::DCTCP, "DCTCP"))
+    .AddAttribute ("TLT", "TCP TLT enabled",
+                   BooleanValue (false),
+                   MakeBooleanAccessor (&TcpSocketBase::m_TLT),
+                   MakeBooleanChecker ())
+    .AddAttribute ("DCTCPWeight",
+                   "Weight for calculating DCTCP's alpha parameter -- deprecated",
+                   DoubleValue (1.0 / 32.0),
+                   MakeDoubleAccessor (&TcpSocketBase::m_g),
+                   MakeDoubleChecker<double> (0, 1))
+    .AddAttribute ("Optimization", "Optimization bits",
+                   UintegerValue (0),
+                   MakeUintegerAccessor (&TcpSocketBase::m_opt),
+                   MakeUintegerChecker<uint32_t> ())
+    .AddAttribute ("TLP", "Enable TLP (Tail Loss Probe)",
+                   BooleanValue (false),
+                   MakeBooleanAccessor (&TcpSocketBase::m_tlp_enabled),
+                   MakeBooleanChecker ())
+    .AddAttribute ("UseStaticRTO", "Use static RTO whose value equals to minRTO",
+                   BooleanValue (false),
+                   MakeBooleanAccessor (&TcpSocketBase::m_use_static_rto),
+                   MakeBooleanChecker ())
     .AddTraceSource ("RTO",
                      "Retransmission timeout",
                      MakeTraceSourceAccessor (&TcpSocketBase::m_rto),
@@ -247,6 +340,13 @@ TcpSocketBase::TcpSocketBase (void)
   m_tcb->m_currentPacingRate = m_tcb->m_maxPacingRate;
   m_pacingTimer.SetFunction (&TcpSocketBase::NotifyPacingPerformed, this);
 
+  m_tlt_unimportant_pkts_current_round = CreateObject<SelectivePacketQueue>();
+  m_tlt_unimportant_pkts_prev_round = CreateObject<SelectivePacketQueue>();
+  NS_ASSERT(m_tlt_unimportant_pkts_current_round);
+  NS_ASSERT(m_tlt_unimportant_pkts_prev_round);
+
+  m_stat_rto_measure = false;
+  
   bool ok;
 
   ok = m_tcb->TraceConnectWithoutContext ("CongestionWindow",
@@ -336,7 +436,12 @@ TcpSocketBase::TcpSocketBase (const TcpSocketBase& sock)
     m_ecnMode (sock.m_ecnMode),
     m_ecnEchoSeq (sock.m_ecnEchoSeq),
     m_ecnCESeq (sock.m_ecnCESeq),
-    m_ecnCWRSeq (sock.m_ecnCWRSeq)
+    m_ecnCWRSeq (sock.m_ecnCWRSeq),
+    m_g (sock.m_g),
+    m_EcnTransition (sock.m_EcnTransition),
+    m_TLT (sock.m_TLT),
+    m_PendingImportant (sock.m_PendingImportant),
+    m_PendingImportantEcho (sock.m_PendingImportantEcho)
 {
   NS_LOG_FUNCTION (this);
   NS_LOG_LOGIC ("Invoked the copy constructor");
@@ -345,6 +450,7 @@ TcpSocketBase::TcpSocketBase (const TcpSocketBase& sock)
     {
       m_rtt = sock.m_rtt->Copy ();
     }
+    
   // Reset all callbacks to null
   Callback<void, Ptr< Socket > > vPS = MakeNullCallback<void, Ptr<Socket> > ();
   Callback<void, Ptr<Socket>, const Address &> vPSA = MakeNullCallback<void, Ptr<Socket>, const Address &> ();
@@ -356,6 +462,28 @@ TcpSocketBase::TcpSocketBase (const TcpSocketBase& sock)
   m_txBuffer = CopyObject (sock.m_txBuffer);
   m_rxBuffer = CopyObject (sock.m_rxBuffer);
   m_tcb = CopyObject (sock.m_tcb);
+
+
+  m_tlt_unimportant_pkts_current_round = CopyObject(sock.m_tlt_unimportant_pkts_current_round);
+  m_tlt_unimportant_pkts_prev_round = CopyObject(sock.m_tlt_unimportant_pkts_prev_round);
+  NS_ASSERT(m_tlt_unimportant_pkts_current_round);
+  NS_ASSERT(m_tlt_unimportant_pkts_prev_round);
+
+  if(!cdf_init) {
+    cdf_init = true;
+    cdf_rto_bg = new unsigned[CDF_MAX / CDF_GRAN];
+    cdf_rtt_bg = new unsigned[CDF_MAX / CDF_GRAN];
+    cdf_rtoperrtt_bg = new unsigned[CDF_RATIO_GRAN * CDF_RATIO_MAX];
+    cdf_rto_fg = new unsigned[CDF_MAX / CDF_GRAN];
+    cdf_rtt_fg = new unsigned[CDF_MAX / CDF_GRAN];
+    cdf_rtoperrtt_fg = new unsigned[CDF_RATIO_GRAN * CDF_RATIO_MAX];
+    memset(cdf_rto_bg, 0, CDF_MAX / CDF_GRAN * sizeof(unsigned));
+    memset(cdf_rtt_bg, 0, CDF_MAX / CDF_GRAN * sizeof(unsigned));
+    memset(cdf_rtoperrtt_bg, 0, CDF_RATIO_GRAN * CDF_RATIO_MAX * sizeof(unsigned));
+    memset(cdf_rto_fg, 0, CDF_MAX / CDF_GRAN * sizeof(unsigned));
+    memset(cdf_rtt_fg, 0, CDF_MAX / CDF_GRAN * sizeof(unsigned));
+    memset(cdf_rtoperrtt_fg, 0, CDF_RATIO_GRAN * CDF_RATIO_MAX * sizeof(unsigned));
+  }
 
   m_tcb->m_currentPacingRate = m_tcb->m_maxPacingRate;
   m_pacingTimer.SetFunction (&TcpSocketBase::NotifyPacingPerformed, this);
@@ -409,6 +537,11 @@ TcpSocketBase::TcpSocketBase (const TcpSocketBase& sock)
   NS_ASSERT (ok == true);
 }
 
+#define FCDF_ENABLE 0
+#if FCDF_ENABLE
+static FILE *fcdf; 
+#endif
+
 TcpSocketBase::~TcpSocketBase (void)
 {
   NS_LOG_FUNCTION (this);
@@ -436,8 +569,196 @@ TcpSocketBase::~TcpSocketBase (void)
     }
   m_tcp = 0;
   CancelAllTimers ();
-}
+  if(stat_print) {
+    // CA_OPEN,      /**< Normal state, no dubious events */
+    // CA_DISORDER,  /**< In all the respects it is "Open",
+    //                 *  but requires a bit more attention. It is entered when
+    //                 *  we see some SACKs or dupacks. It is split of "Open" */
+    // CA_CWR,       /**< cWnd was reduced due to some Congestion Notification event.
+    //                 *  It can be ECN, ICMP source quench, local device congestion.
+    //                 *  Not used in NS-3 right now. */
+    // CA_RECOVERY,  /**< CWND was reduced, we are fast-retransmitting. */
+    // CA_LOSS,
+    printf("%.8lf\tRETX_TIMEOUT\t%p\t%lu\n", Simulator::Now().GetSeconds(), this, reTxTimeoutCnt);
+    printf("%.8lf\tTCP_IMP_OPEN\t%p\t%lu\n", Simulator::Now().GetSeconds(), this, statImpDataTcp[0]);
+    printf("%.8lf\tTCP_IMP_DISORDER\t%p\t%lu\n", Simulator::Now().GetSeconds(), this, statImpDataTcp[1]);
+    printf("%.8lf\tTCP_IMP_CWR\t%p\t%lu\n", Simulator::Now().GetSeconds(), this, statImpDataTcp[2]);
+    printf("%.8lf\tTCP_IMP_RECOVERY\t%p\t%lu\n", Simulator::Now().GetSeconds(), this, statImpDataTcp[3]);
+    printf("%.8lf\tTCP_IMP_LOSS\t%p\t%lu\n", Simulator::Now().GetSeconds(), this, statImpDataTcp[4]);
+    printf("%.8lf\tTCP_UIMP_OPEN\t%p\t%lu\n", Simulator::Now().GetSeconds(), this, statUimpDataTcp[0]);
+    printf("%.8lf\tTCP_UIMP_DISORDER\t%p\t%lu\n", Simulator::Now().GetSeconds(), this, statUimpDataTcp[1]);
+    printf("%.8lf\tTCP_UIMP_CWR\t%p\t%lu\n", Simulator::Now().GetSeconds(), this, statUimpDataTcp[2]);
+    printf("%.8lf\tTCP_UIMP_RECOVERY\t%p\t%lu\n", Simulator::Now().GetSeconds(), this, statUimpDataTcp[3]);
+    printf("%.8lf\tTCP_UIMP_LOSS\t%p\t%lu\n", Simulator::Now().GetSeconds(), this, statUimpDataTcp[4]);
+    printf("%.8lf\tRX_PAYLOAD_LEN\t%p\t%lu\n", Simulator::Now().GetSeconds(), this, rxTotalBytes);
+    printf("%.8lf\tTCP_LOSS_MASKING\t%p\t%lu\n", Simulator::Now().GetSeconds(), this, numExperienceLossMasking);
 
+    // double max_rto = 0.0;
+    // TcpSocketBase *max_sb = nullptr;
+    // for (auto iter = stat_max_rtt_record.begin(); iter != stat_max_rtt_record.end(); ++iter)
+    // {
+    //   if (iter->second.first > max_rto && iter->second.second > 40) {
+    //     bool fit = true;
+    //     if (iter->second.first == iter->first->m_stat_rto_time.begin()->second.second.GetSeconds()) {
+    //       fit = false;
+    //     }
+    //     double max_rtt = 0;
+    //     int max_rtt_ord = -1;
+    //     int max_rtt_cnt = 0;
+    //     for (auto it2 = iter->first->m_stat_rto_time.begin(); it2 != iter->first->m_stat_rto_time.end(); ++it2)
+    //     {
+    //       if(it2->second.first.GetSeconds() > max_rtt) {
+    //         max_rtt = it2->second.first.GetSeconds();
+    //         max_rtt_ord = max_rtt_cnt;
+    //       }
+    //       max_rtt_cnt++;
+    //     }
+    //     if (max_rtt_ord == 0) {
+    //       fit = false;
+    //     }
+    //     if (fit)
+    //     {
+    //       max_rto = iter->second.first;
+    //       max_sb = iter->first;
+    //     }
+    //   }
+    // }
+    // if(max_sb) {
+    //   for (auto iter = max_sb->m_stat_rto_time.begin(); iter != max_sb->m_stat_rto_time.end(); ++iter) {
+    //     printf("%.8lf\tRTOMIN_STAT\t%p\t%.8lf\t%.8lf\t%.8lf\n", Simulator::Now().GetSeconds(), this, iter->first.GetSeconds(), iter->second.first.GetSeconds(), iter->second.second.GetSeconds());
+    //   }
+    // }
+
+    for (int i=0; i< CDF_MAX/CDF_GRAN; i++) {
+      if(cdf_rtt_bg[i])
+        printf("%.8lf\tCDF_RTT_BG\t%d\t%u\n", Simulator::Now().GetSeconds(), i*CDF_GRAN, cdf_rtt_bg[i]);
+    }
+    for (int i=0; i< CDF_MAX/CDF_GRAN; i++) {
+      if(cdf_rto_bg[i])
+        printf("%.8lf\tCDF_RTO_BG\t%d\t%u\n", Simulator::Now().GetSeconds(), i*CDF_GRAN, cdf_rto_bg[i]);
+    }
+    unsigned long rtt_pkt_num = 0;
+    for (int i = 0; i < CDF_MAX / CDF_GRAN; i++)
+    {
+      if(cdf_rtt_fg[i]) {
+        printf("%.8lf\tCDF_RTT_FG\t%d\t%u\n", Simulator::Now().GetSeconds(), i*CDF_GRAN, cdf_rtt_fg[i]);
+        if (i * CDF_GRAN < 1000000) {
+          rtt_pkt_num += cdf_rtt_fg[i];
+        }
+      }
+    }
+
+    for (int i=0; i< CDF_RATIO_GRAN * CDF_RATIO_MAX; i++) {
+      if(cdf_rtoperrtt_fg[i])
+        printf("%.8lf\tCDF_RTOPERRTT_FG\t%lf\t%u\n", Simulator::Now().GetSeconds(), ((double)i)/((double)CDF_RATIO_GRAN), cdf_rtoperrtt_fg[i]);
+    }
+    for (int i=0; i< CDF_RATIO_GRAN * CDF_RATIO_MAX; i++) {
+      if(cdf_rtoperrtt_bg[i])
+        printf("%.8lf\tCDF_RTOPERRTT_BG\t%lf\t%u\n", Simulator::Now().GetSeconds(), ((double)i)/((double)CDF_RATIO_GRAN), cdf_rtoperrtt_bg[i]);
+    }
+    unsigned long acc_rtt_pkt_num = 0;
+    for (int i = 0; i < CDF_MAX / CDF_GRAN; i++)
+    {
+      if(cdf_rtt_fg[i]) {
+        acc_rtt_pkt_num += cdf_rtt_fg[i];
+        if (acc_rtt_pkt_num >= 0.95 * rtt_pkt_num)
+        {
+          printf("%.8lf\tCDF_RTT_FG_95PCT\t%d\n", Simulator::Now().GetSeconds(), i*CDF_GRAN);
+          break;
+        }
+      }
+    }
+    
+    acc_rtt_pkt_num = 0;
+    for (int i = 0; i < CDF_MAX / CDF_GRAN; i++)
+    {
+      if(cdf_rtt_fg[i]) {
+        acc_rtt_pkt_num += cdf_rtt_fg[i];
+        if (acc_rtt_pkt_num >= 0.99 * rtt_pkt_num)
+        {
+          printf("%.8lf\tCDF_RTT_FG_99PCT\t%d\n", Simulator::Now().GetSeconds(), i*CDF_GRAN);
+          break;
+        }
+      }
+    }
+
+
+    
+    unsigned long rto_pkt_num = 0;
+    for (int i=0; i< CDF_MAX/CDF_GRAN; i++) {
+      if(cdf_rto_fg[i]) {
+        printf("%.8lf\tCDF_RTO_FG\t%d\t%u\n", Simulator::Now().GetSeconds(), i*CDF_GRAN, cdf_rto_fg[i]);
+        rto_pkt_num += cdf_rto_fg[i];
+      }
+    }
+
+    unsigned long acc_rto_pkt_num = 0;
+    for (int i = 0; i < CDF_MAX / CDF_GRAN; i++)
+    {
+      if(cdf_rto_fg[i]) {
+        acc_rto_pkt_num += cdf_rto_fg[i];
+        if (acc_rto_pkt_num >= 0.95 * rto_pkt_num)
+        {
+          printf("%.8lf\tCDF_RTO_FG_95PCT\t%d\n", Simulator::Now().GetSeconds(), i*CDF_GRAN);
+          break;
+        }
+      }
+    }
+    
+    acc_rto_pkt_num = 0;
+    for (int i = 0; i < CDF_MAX / CDF_GRAN; i++)
+    {
+      if(cdf_rto_fg[i]) {
+        acc_rto_pkt_num += cdf_rto_fg[i];
+        if (acc_rto_pkt_num >= 0.99 * rto_pkt_num)
+        {
+          printf("%.8lf\tCDF_RTO_FG_99PCT\t%d\n", Simulator::Now().GetSeconds(), i*CDF_GRAN);
+          break;
+        }
+      }
+    }
+
+
+
+      stat_print = false;
+  }
+  if(this->socketId >= 0) {
+    // printf("%.8lf\tTLT_FORCE_RETX\t%u\t%lu\n", Simulator::Now().GetSeconds(), this->socketId, stat_uimp_forcegen);
+    // printf("%.8lf\tTX_PKT_COUNT\t%u\t%lu\n", Simulator::Now().GetSeconds(), this->socketId, txTotalPkts);
+    // printf("%.8lf\tTX_PKT_LEN\t%u\t%lu\n", Simulator::Now().GetSeconds(), this->socketId, txTotalBytes);
+    // printf("%.8lf\tTX_PKT_IMP_LEN\t%u\t%lu\n", Simulator::Now().GetSeconds(), this->socketId, txTotalBytesImp);
+    // printf("%.8lf\tTX_PKT_UIMP_LEN\t%u\t%lu\n", Simulator::Now().GetSeconds(), this->socketId, txTotalBytesUimp);
+    // printf("%.8lf\tPER_FLOW_RTO\t%u\t%lu\n", Simulator::Now().GetSeconds(), this->socketId, rtoPerFlow);
+  }
+
+  // if(this == max_rto_burst_item) {
+  //   for (auto iter = m_stat_rto_time.begin(); iter != m_stat_rto_time.end(); ++iter) {
+  //     printf("%.8lf\tRTOMIN_STAT\t%p\t%.8lf\t%.8lf\t%.8lf\n", Simulator::Now().GetSeconds(), this, iter->first.GetSeconds(), iter->second.first.GetSeconds(), iter->second.second.GetSeconds());
+  //   }
+  // }
+
+  int stat_xmit_len = (int)stat_xmit.size();
+  if((int)stat_ack.size() != stat_xmit_len) {
+    fprintf(stderr, "STAT ack inconsistent, stat_xmit_len = %d, stat_ack_len = %d\n", (int)stat_xmit.size(), (int)stat_ack.size());
+    stat_xmit_len = (int)stat_ack.size() < stat_xmit_len ? (int)stat_ack.size() : stat_xmit_len;
+  }
+
+#if FCDF_ENABLE
+  if(!fcdf) {
+    char buf[256] = {
+        0,
+    };
+    sprintf(buf, "%s_seq_latency.txt", argv1);
+    fcdf = fopen(buf, "w");
+  }
+  if(fcdf) {
+    for(int i = 0; i < stat_xmit_len; i++) {
+      fprintf(fcdf, "%u\t%u\t%u\t%.9lf\t%.9lf\t%.9lf\n", this->socketId, i, m_lastTxSeq.GetValue(), (stat_xmit[i]).GetSeconds(), (stat_ack[i]).GetSeconds(), (stat_ack[i] - stat_xmit[i]).GetSeconds());
+    }
+  }
+#endif
+
+} 
 /* Associate a node with this TCP socket */
 void
 TcpSocketBase::SetNode (Ptr<Node> node)
@@ -457,6 +778,7 @@ void
 TcpSocketBase::SetRtt (Ptr<RttEstimator> rtt)
 {
   m_rtt = rtt;
+  //FIX: implement SetG
 }
 
 /* Inherit from Socket class: Returns error code */
@@ -688,6 +1010,8 @@ TcpSocketBase::Connect (const Address & address)
   m_synCount = m_synRetries;
   m_dataRetrCount = m_dataRetries;
 
+  m_flowStartTime = Simulator::Now();
+
   // DoConnect() will do state-checking and send a SYN packet
   return DoConnect ();
 }
@@ -709,7 +1033,29 @@ TcpSocketBase::Listen (void)
   m_state = LISTEN;
   return 0;
 }
+#if DEBUG_PRINT
+static void backtrace_print(int flowid) {
+  int j, nptrs;
+    void *buffer[100];
+    char **strings;
 
+   nptrs = backtrace(buffer, 100);
+    
+   /* The call backtrace_symbols_fd(buffer, nptrs, STDOUT_FILENO)
+       would produce similar output to the following: */
+
+   strings = backtrace_symbols(buffer, nptrs);
+    if (strings == NULL) {
+        perror("backtrace_symbols");
+        exit(EXIT_FAILURE);
+    }
+
+   for (j = 0; j < nptrs; j++)
+        fprintf(stderr, "Flow %d : %s\n", flowid, strings[j]);
+
+   free(strings);
+}
+#endif
 /* Inherit from Socket class: Kill this socket and signal the peer (if any) */
 int
 TcpSocketBase::Close (void)
@@ -718,6 +1064,7 @@ TcpSocketBase::Close (void)
   /// \internal
   /// First we check to see if there is any unread rx data.
   /// \bugid{426} claims we should send reset in this case.
+  //std::cout << "Socket CLOSE " << this << std::endl;
   if (m_rxBuffer->Size () != 0)
     {
       NS_LOG_WARN ("Socket " << this << " << unread rx data during close.  Sending reset." <<
@@ -735,6 +1082,14 @@ TcpSocketBase::Close (void)
         }
       return 0;
     }
+    #if DEBUG_PRINT
+    if(socket_rcv_id >= 0) {
+      std::cerr <<"Flow " << socket_rcv_id << " : Receiver - Closing socket" << std::endl;
+      backtrace_print(socket_rcv_id);
+    }if(socketId >= 0) {
+      std::cerr <<"Flow " << socketId << " : Sender -  Closing socket" << std::endl;
+    }
+    #endif
   return DoClose ();
 }
 
@@ -744,6 +1099,9 @@ TcpSocketBase::ShutdownSend (void)
 {
   NS_LOG_FUNCTION (this);
 
+  #if DEBUG_PRINT
+  std::cerr<< "Flow " << (int)(socketId) << " : Shutting down send - state=" << TcpStateName[m_state] << std::endl;
+  #endif
   //this prevents data from being added to the buffer
   m_shutdownSend = true;
   m_closeOnEmpty = true;
@@ -961,6 +1319,10 @@ int
 TcpSocketBase::SetupCallback (void)
 {
   NS_LOG_FUNCTION (this);
+  
+  if (m_ecnMode != EcnMode_t::NoEcn) {
+    m_tcb->m_ecnConn = true;
+  } 
 
   if (m_endPoint == nullptr && m_endPoint6 == nullptr)
     {
@@ -992,8 +1354,9 @@ TcpSocketBase::DoConnect (void)
   if (m_state == CLOSED || m_state == LISTEN || m_state == SYN_SENT || m_state == LAST_ACK || m_state == CLOSE_WAIT)
     { // send a SYN packet and change state into SYN_SENT
       // send a SYN packet with ECE and CWR flags set if sender is ECN capable
-      if (m_ecnMode == EcnMode_t::ClassicEcn)
+      if (m_tcb->m_ecnConn)
         {
+          NS_LOG_LOGIC (this << " ECN capable connection, sending ECN setup SYN");
           SendEmptyPacket (TcpHeader::SYN | TcpHeader::ECE | TcpHeader::CWR);
         }
       else
@@ -1113,26 +1476,175 @@ TcpSocketBase::ForwardUp (Ptr<Packet> packet, Ipv4Header header, uint16_t port,
   TcpHeader tcpHeader;
   uint32_t bytesRemoved = packet->PeekHeader (tcpHeader);
 
+  {
+    PfcExperienceTag pet;
+    if (packet->PeekPacketTag(pet)) {
+        if(pet.m_socketId)
+          remoteSocketId = pet.m_socketId;
+    }
+    // if(pet.m_socketId)
+    //   remoteSocketId = pet.m_socketId;
+    // int32_t sid = socketId;
+    // if (sid < 0)
+    //   sid = remoteSocketId;
+    // if (PausedTime.find(sid) == PausedTime.end())
+    //   PausedTime[sid] = Seconds(0);
+
+    // if (packet->PeekPacketTag(pet))
+    // {
+    //   if(pet.m_start && !PausedTimeStart) {
+    //     PausedTimeStart = pet.m_start;
+    //   } else if (!pet.m_start && PausedTimeStart) {
+    //     PausedTime[sid] = PausedTime[sid] + (Simulator::Now() - NanoSeconds(PausedTimeStart)) + NanoSeconds(pet.m_accumulate);
+    //     PausedTimeStart = 0;
+    //   }
+    // }
+    // else if (PausedTimeStart)
+    // {
+    //   PausedTime[sid] = PausedTime[sid] + (Simulator::Now() - NanoSeconds(PausedTimeStart));
+    //   PausedTimeStart = 0;
+    // }
+  }
+  {
+    TcpFlowIdTag tft;
+    if (!packet->PeekPacketTag(tft)) {
+      std::cerr << "This packet does not have info about flow, socketid="  << socketId << std::endl;
+      abort();
+    }
+    // if(tft.m_socketId < 0) {
+    //   std::cerr << "This packet does not have info about flow2, socketid="  << socketId << std::endl;
+    //   abort();
+    // }
+    m_recent_tft = tft;
+  }
+  // for test purpose : drop packet 2 twice
+  // if (tcpHeader.GetSequenceNumber().GetValue() == 1441) {
+  //   static int debug_test_dropcnt = 0;
+  //   TltTag tlt;
+  //   if(debug_test_dropcnt < 1 && (!m_TLT || (packet->PeekPacketTag(tlt) && tlt.GetType() == TltTag::PACKET_NOT_IMPORTANT) )) {
+  //     debug_test_dropcnt++;
+  //     return;
+  //   }
+  // }
+  //  if (tcpHeader.GetSequenceNumber().GetValue() == 2881) {
+  //   static int debug_test_dropcnt = 0;
+  //   TltTag tlt;
+  //   if(debug_test_dropcnt < 1 && (!m_TLT || (packet->PeekPacketTag(tlt) && tlt.GetType() == TltTag::PACKET_NOT_IMPORTANT) )) {
+  //     debug_test_dropcnt++;
+  //     return;
+  //   }
+  // }
+  // // if (tcpHeader.GetSequenceNumber().GetValue() == 15801) {
+  //   static int debug_test_dropcnt = 0;
+  //   TltTag tlt;
+  //   if(debug_test_dropcnt < 2 && (!m_TLT || (packet->PeekPacketTag(tlt) && tlt.GetType() == TltTag::PACKET_NOT_IMPORTANT) )) {
+  //     debug_test_dropcnt++;
+  //     return;
+  //   }
+  // }
+
+  TltTag tlt;
+  if (m_TLT) {
+    if (packet->PeekPacketTag(tlt)) {
+      if (tlt.GetType() == TltTag::PACKET_IMPORTANT_ECHO) {
+        if ((m_PendingImportant == ImpPendingNormal || m_PendingImportant == ImpPendingForce) && m_state == ESTABLISHED) {
+          std::cout << "WARN : Already pending important here... two important echoes?" << std::endl;
+        }
+        if (m_highestImportantAck < tcpHeader.GetAckNumber())
+          m_highestImportantAck = tcpHeader.GetAckNumber();
+        m_PendingImportant = ImpPendingNormal;
+      } else if (tlt.GetType() == TltTag::PACKET_IMPORTANT && !(tcpHeader.GetFlags() & TcpHeader::SYN)) {
+        // do not turn on Echo flag on SYN
+        m_PendingImportantEcho = ImpPendingNormal;
+        #if DEBUG_PRINT
+        std::cerr<< "Flow " << (int)(tlt.debug_socketId) << " : Recv Imp " << tcpHeader.GetSequenceNumber() << std::endl;
+        #endif
+      } else if (tlt.GetType() == TltTag::PACKET_IMPORTANT_FORCE && !(tcpHeader.GetFlags() & TcpHeader::SYN)) {
+        // do not turn on Echo flag on SYN
+        m_PendingImportantEcho = ImpPendingForce;
+        #if DEBUG_PRINT
+        std::cerr<< "Flow " << (int)(tlt.debug_socketId) << " : Recv ImpF " <<  tcpHeader.GetSequenceNumber()  << std::endl;
+        #endif
+      } else if (tlt.GetType() == TltTag::PACKET_IMPORTANT_ECHO_FORCE) {
+        if (m_highestImportantAck < tcpHeader.GetAckNumber())
+          m_highestImportantAck = tcpHeader.GetAckNumber();
+        m_PendingImportant = ImpPendingNormal;
+        if (!IsValidTcpSegment (tcpHeader.GetSequenceNumber (), bytesRemoved, packet->GetSize () - bytesRemoved))
+          return;
+        if(tcpHeader.GetAckNumber() < m_txBuffer->HeadSequence()) {
+          // do not deliver to TCP layer
+          return;
+        }
+      } else if (tlt.GetType() == TltTag::PACKET_NOT_IMPORTANT) {
+        #if DEBUG_PRINT
+        std::cerr<< "Flow " << (int)(tlt.debug_socketId) << " : Recv Uimp " <<  tcpHeader.GetSequenceNumber() << std::endl;
+        #endif
+      } else if (tlt.GetType() == TltTag::PACKET_IMPORTANT_CONTROL) {
+        #if DEBUG_PRINT
+        std::cerr<< "Flow " << (int)(tlt.debug_socketId) << " : Recv ImpCtrl " <<  tcpHeader.GetSequenceNumber() << std::endl;
+        #endif
+      }
+      else if (tlt.GetType() == TltTag::PACKET_IMPORTANT_FAST_RETRANS)
+      {
+        #if DEBUG_PRINT
+        std::cerr<< "Flow " << (int)(tlt.debug_socketId) << " : Recv ImpfR " <<  tcpHeader.GetSequenceNumber() << std::endl;
+        #endif
+      }
+    } else {
+      NS_ASSERT(0);
+        std::cerr<< "Flow Unknown: No TLT H" << std::endl;
+      abort();
+    }
+  }
+
   if (!IsValidTcpSegment (tcpHeader.GetSequenceNumber (), bytesRemoved,
                           packet->GetSize () - bytesRemoved))
     {
+      #if DEBUG_PRINT
+      TltTag tlt;
+      if (packet->PeekPacketTag(tlt)) {
+        std::cerr<< "Flow " << (int)(tlt.debug_socketId) << " : Invalid TCP Segment Seq=" <<  tcpHeader.GetSequenceNumber() << std::endl;
+      }
+      #endif
       return;
     }
-
+ #if DEBUG_PRINT
+      TltTag tlt;
+      if (packet->PeekPacketTag(tlt)) {
+        std::cerr<< "Flow " << (int)(tlt.debug_socketId) << " : Recv valid TCP Segment Seq=" <<  tcpHeader.GetSequenceNumber() << ", state=" << TcpStateName[m_state] << std::endl;
+        socket_rcv_id = tlt.debug_socketId;
+      }
+      #endif
   if (header.GetEcn() == Ipv4Header::ECN_CE && m_ecnCESeq < tcpHeader.GetSequenceNumber ())
     {
       NS_LOG_INFO ("Received CE flag is valid");
       NS_LOG_DEBUG (TcpSocketState::EcnStateName[m_tcb->m_ecnState] << " -> ECN_CE_RCVD");
       m_ecnCESeq = tcpHeader.GetSequenceNumber ();
       m_tcb->m_ecnState = TcpSocketState::ECN_CE_RCVD;
-      m_congestionControl->CwndEvent (m_tcb, TcpSocketState::CA_EVENT_ECN_IS_CE);
+      
+      m_congestionControl->CwndEvent (m_tcb, TcpSocketState::CA_EVENT_ECN_IS_CE, this);
     }
   else if (header.GetEcn() != Ipv4Header::ECN_NotECT && m_tcb->m_ecnState != TcpSocketState::ECN_DISABLED)
     {
-      m_congestionControl->CwndEvent (m_tcb, TcpSocketState::CA_EVENT_ECN_NO_CE);
+      m_congestionControl->CwndEvent (m_tcb, TcpSocketState::CA_EVENT_ECN_NO_CE, this);
     }
 
+  Ipv4EcnTag ecn;
+  ecn.SetEcn(header.GetEcn());
+  packet->AddPacketTag(ecn);
+
   DoForwardUp (packet, fromAddress, toAddress);
+
+  // Must be done after DoForwardUp
+  if (m_TLT) {
+    if (tlt.GetType() == TltTag::PACKET_IMPORTANT_ECHO || tlt.GetType() == TltTag::PACKET_IMPORTANT_ECHO_FORCE) {
+      m_tlt_unimportant_pkts_prev_round = m_tlt_unimportant_pkts_current_round;
+      m_tlt_unimportant_pkts_current_round = CreateObject<SelectivePacketQueue>();
+      NS_ASSERT(m_tlt_unimportant_pkts_prev_round);
+      NS_ASSERT(m_tlt_unimportant_pkts_current_round);
+      
+    }
+  }
 }
 
 void
@@ -1164,11 +1676,11 @@ TcpSocketBase::ForwardUp6 (Ptr<Packet> packet, Ipv6Header header, uint16_t port,
       NS_LOG_DEBUG (TcpSocketState::EcnStateName[m_tcb->m_ecnState] << " -> ECN_CE_RCVD");
       m_ecnCESeq = tcpHeader.GetSequenceNumber ();
       m_tcb->m_ecnState = TcpSocketState::ECN_CE_RCVD;
-      m_congestionControl->CwndEvent (m_tcb, TcpSocketState::CA_EVENT_ECN_IS_CE);
+      m_congestionControl->CwndEvent (m_tcb, TcpSocketState::CA_EVENT_ECN_IS_CE, this);
     }
   else if (header.GetEcn() != Ipv6Header::ECN_NotECT)
     {
-      m_congestionControl->CwndEvent (m_tcb, TcpSocketState::CA_EVENT_ECN_NO_CE);
+      m_congestionControl->CwndEvent (m_tcb, TcpSocketState::CA_EVENT_ECN_NO_CE, this);
     }
 
   DoForwardUp (packet, fromAddress, toAddress);
@@ -1239,6 +1751,12 @@ TcpSocketBase::DoForwardUp (Ptr<Packet> packet, const Address &fromAddress,
   packet->RemoveHeader (tcpHeader);
   SequenceNumber32 seq = tcpHeader.GetSequenceNumber ();
 
+ 
+  if (tcpHeader.GetAckNumber().GetValue() > targetLen && lastUsedTcp.GetSeconds() == 0 && tcpHeader.GetFlags () & TcpHeader::ACK) {
+    lastUsedTcp = Simulator::Now();
+  }
+  lastAckTcp = tcpHeader.GetAckNumber();
+  
   if (m_state == ESTABLISHED && !(tcpHeader.GetFlags () & TcpHeader::RST))
     {
       // Check if the sender has responded to ECN echo by reducing the Congestion Window
@@ -1313,7 +1831,7 @@ TcpSocketBase::DoForwardUp (Ptr<Packet> packet, const Address &fromAddress,
           if (!tcpHeader.HasOption (TcpOption::TS))
             {
               // Ignoring segment without TS, RFC 7323
-              NS_LOG_LOGIC ("At state " << TcpStateName[m_state] <<
+              NS_LOG_WARN ("At state " << TcpStateName[m_state] <<
                             " received packet of seq [" << seq <<
                             ":" << seq + packet->GetSize () <<
                             ") without TS option. Silently discard it");
@@ -1371,6 +1889,20 @@ TcpSocketBase::DoForwardUp (Ptr<Packet> packet, const Address &fromAddress,
           h.SetWindowSize (AdvertisedWindowSize ());
           AddOptions (h);
           m_txTrace (p, h, this);
+          {
+            PfcExperienceTag pet;
+            if (!p->PeekPacketTag(pet))
+            {
+              if(socketId >= 0) {
+                pet.m_socketId = socketId;
+                p->AddPacketTag(pet);
+              } else if (remoteSocketId >= 0) {
+                pet.m_socketId = remoteSocketId;
+                p->AddPacketTag(pet);
+              }
+            }
+          }
+          embed_tft(this, p);
           m_tcp->SendPacket (p, h, toAddress, fromAddress, m_boundnetdevice);
         }
       break;
@@ -1403,6 +1935,10 @@ TcpSocketBase::DoForwardUp (Ptr<Packet> packet, const Address &fromAddress,
 
       SendPendingData (m_connected);
     }
+
+  if(m_PendingImportantEcho != ImpIdle) {
+    std::cerr << "Flow " << socketId << " : There are going to be a timeout... - State : " << TcpStateName[m_state] << std::endl;
+}
 }
 
 /* Received a packet upon ESTABLISHED state. This function is mimicking the
@@ -1550,6 +2086,9 @@ TcpSocketBase::EnterRecovery ()
           // We received 3 dupacks, but the head is not marked as lost
           // (received less than 3 SACK block ahead).
           // Manually set it as lost.
+          #if DEBUG_PRINT
+          std::cerr << "Flow " << socketId << " : Marking head as lost (seq=" << m_txBuffer->HeadSequence().GetValue() << ")" << std::endl;
+          #endif
           m_txBuffer->MarkHeadAsLost ();
         }
     }
@@ -1559,6 +2098,9 @@ TcpSocketBase::EnterRecovery ()
   // (4.1) RecoveryPoint = HighData
   m_recover = m_tcb->m_highTxMark;
 
+  #if DEBUG_PRINT
+  std::cerr << "Flow " << socketId << " : m_recover=" << m_recover << std::endl;
+  #endif
   m_congestionControl->CongestionStateSet (m_tcb, TcpSocketState::CA_RECOVERY);
   m_tcb->m_congState = TcpSocketState::CA_RECOVERY;
 
@@ -1575,7 +2117,7 @@ TcpSocketBase::EnterRecovery ()
                " calculated in flight: " << bytesInFlight);
 
   // (4.3) Retransmit the first data segment presumed dropped
-  DoRetransmit ();
+  DoRetransmit (true);
   // (4.4) Run SetPipe ()
   // (4.5) Proceed to step (C)
   // these steps are done after the ProcessAck function (SendPendingData)
@@ -1617,6 +2159,10 @@ TcpSocketBase::DupAck ()
       NS_LOG_DEBUG ("CA_OPEN -> CA_DISORDER");
     }
 
+  #if DEBUG_PRINT
+  std::cerr << "Flow " << socketId << " : DupAck - m_dupAckCount=" << m_dupAckCount << ", state="<< TcpSocketState::TcpCongStateName[m_tcb->m_congState] <<std::endl;
+  #endif
+
   if (m_tcb->m_congState == TcpSocketState::CA_RECOVERY)
     {
       if (!m_sackEnabled)
@@ -1629,13 +2175,17 @@ TcpSocketBase::DupAck ()
       NS_LOG_INFO (m_dupAckCount << " Dupack received in fast recovery mode."
                    "Increase cwnd to " << m_tcb->m_cWnd);
     }
-  else if (m_tcb->m_congState == TcpSocketState::CA_DISORDER)
+  else if ((m_tcb->m_congState == TcpSocketState::CA_DISORDER) ||
+  (m_tcb->m_congState == TcpSocketState::CA_CWR))
     {
       // RFC 6675, Section 5, continuing:
       // ... and take the following steps:
       // (1) If DupAcks >= DupThresh, go to step (4).
       if ((m_dupAckCount == m_retxThresh) && (m_highRxAckMark >= m_recover))
         {
+        #if DEBUG_PRINT
+          std::cerr << "Flow " << socketId << " : Entering recovery - m_dupAckCount = " << m_dupAckCount << std::endl;
+        #endif
           EnterRecovery ();
           NS_ASSERT (m_tcb->m_congState == TcpSocketState::CA_RECOVERY);
         }
@@ -1687,6 +2237,12 @@ TcpSocketBase::ReceivedAck (Ptr<Packet> packet, const TcpHeader& tcpHeader)
   SequenceNumber32 oldHeadSequence = m_txBuffer->HeadSequence ();
   m_txBuffer->DiscardUpTo (ackNumber);
 
+  if(m_TLT) {
+    m_tlt_unimportant_pkts.discardUpTo(ackNumber);
+    m_tlt_unimportant_pkts_prev_round->discardUpTo(ackNumber);
+    m_tlt_unimportant_pkts_current_round->discardUpTo(ackNumber);
+  }
+
   if (ackNumber > oldHeadSequence && (m_tcb->m_ecnState != TcpSocketState::ECN_DISABLED) && (tcpHeader.GetFlags () & TcpHeader::ECE))
     {
       if (m_ecnEchoSeq < ackNumber)
@@ -1698,9 +2254,41 @@ TcpSocketBase::ReceivedAck (Ptr<Packet> packet, const TcpHeader& tcpHeader)
         }
     }
 
+
+  // XXX ECN Support, state goes into CA_CWR when receives ECE in TCP header
+  //if(tcpHeader.GetFlags() & TcpHeader::ECE) {
+    //std::cout << "ECE received, queueCwr=" << m_tcb->m_queueCWR << std::endl;
+  //}
+  if (m_tcb->m_ecnConn
+          && tcpHeader.GetFlags() & TcpHeader::ECE
+          && m_tcb->m_queueCWR == false)
+  {
+      if (m_tcb->m_congState == TcpSocketState::CA_OPEN ||
+              m_tcb->m_congState == TcpSocketState::CA_DISORDER) { // Only OPEN and DISORDER state can go into the CWR state
+        NS_LOG_WARN (TcpSocketState::TcpCongStateName[m_tcb->m_congState] <<
+              " -> CA_CWR");
+        // The ssThresh and cWnd should be reduced because of the congestion notification
+        m_tcb->m_ssThresh = m_congestionControl->GetSsThresh (m_tcb, BytesInFlight());
+        auto prev_cwnd = m_tcb->m_cWnd;
+        m_tcb->m_cWnd = m_congestionControl->GetCwnd(m_tcb);
+        m_tcb->m_congState = TcpSocketState::CA_CWR;
+        m_tcb->m_queueCWR = true;
+      }
+  }
+
   // RFC 6675 Section 5: 2nd, 3rd paragraph and point (A), (B) implementation
   // are inside the function ProcessAck
-  ProcessAck (ackNumber, scoreboardUpdated, oldHeadSequence);
+  if(socketId>=0) {
+    TltTag tlt;
+    packet->PeekPacketTag(tlt);
+        #if DEBUG_PRINT
+    std::cerr<< "Flow " << socketId << " : Recv Ack " << ackNumber <<" (" << (int)(tlt.GetType()) << ")" << std::endl;
+    #endif
+  }
+  while ((int)stat_ack.size() < (int) ((ackNumber).GetValue()/1440)) {
+    stat_ack.push_back(Simulator::Now());
+  }
+  ProcessAck (ackNumber, scoreboardUpdated, oldHeadSequence, tcpHeader.GetFlags() & TcpHeader::ECE);
 
   // If there is any data piggybacked, store it into m_rxBuffer
   if (packet->GetSize () > 0)
@@ -1711,11 +2299,69 @@ TcpSocketBase::ReceivedAck (Ptr<Packet> packet, const TcpHeader& tcpHeader)
   // RFC 6675, Section 5, point (C), try to send more data. NB: (C) is implemented
   // inside SendPendingData
   SendPendingData (m_connected);
+  
+  if (m_TLT && m_PendingImportant==ImpPendingNormal && m_txBuffer->Size()) {
+	  NS_LOG_LOGIC(" WAS NO SEND - freq");
+	  // TLT immediate write required
+	  NS_LOG_LOGIC("forceSendTLT trying to send packets, Head=" << m_txBuffer->HeadSequence());
+    bool tlt_success;
+    if(OPTIMIZE_LEVEL(7) && OPTIMIZE_LEVEL(8)) {
+      if(m_tcb->m_congState == TcpSocketState::CA_CWR) {
+        m_tlt_send_unit = 1440;
+      }
+      tlt_success = forceSendTLT();
+      if(m_tlt_send_unit == 1) m_tlt_send_unit = 2;
+      else if(m_tlt_send_unit == 2) m_tlt_send_unit = 3;
+      else if(m_tlt_send_unit == 3) m_tlt_send_unit = 6;
+      else if(m_tlt_send_unit == 6) m_tlt_send_unit = 11;
+      else if(m_tlt_send_unit == 11) m_tlt_send_unit = 22;
+      else if(m_tlt_send_unit == 22) m_tlt_send_unit = 45;
+      else if(m_tlt_send_unit == 45) m_tlt_send_unit = 90;
+      else if(m_tlt_send_unit == 90) m_tlt_send_unit = 180;
+      else if(m_tlt_send_unit == 180) m_tlt_send_unit = 360;
+      else if(m_tlt_send_unit == 360) m_tlt_send_unit = 720;
+      else if(m_tlt_send_unit == 720) m_tlt_send_unit = 1440;
+
+    } else if(OPTIMIZE_LEVEL(7)) {
+	    tlt_success = forceSendTLT();
+      //1-2-3-6-11-22-45-90-180-360-720-1440
+      if(m_tlt_send_unit == 1) m_tlt_send_unit = 2;
+      else if(m_tlt_send_unit == 2) m_tlt_send_unit = 3;
+      else if(m_tlt_send_unit == 3) m_tlt_send_unit = 6;
+      else if(m_tlt_send_unit == 6) m_tlt_send_unit = 11;
+      else if(m_tlt_send_unit == 11) m_tlt_send_unit = 22;
+      else if(m_tlt_send_unit == 22) m_tlt_send_unit = 45;
+      else if(m_tlt_send_unit == 45) m_tlt_send_unit = 90;
+      else if(m_tlt_send_unit == 90) m_tlt_send_unit = 180;
+      else if(m_tlt_send_unit == 180) m_tlt_send_unit = 360;
+      else if(m_tlt_send_unit == 360) m_tlt_send_unit = 720;
+      else if(m_tlt_send_unit == 720) m_tlt_send_unit = 1440;
+    } else if(OPTIMIZE_LEVEL(10)) {
+      //stays 1
+      m_tlt_send_unit = 1;
+	    tlt_success = forceSendTLT();
+    } else if(OPTIMIZE_LEVEL(8)) {
+      if(m_tcb->m_congState == TcpSocketState::CA_CWR) {
+        m_tlt_send_unit = 1440;
+      }
+	    tlt_success = forceSendTLT();
+    } else {
+      m_tlt_send_unit = 1440;
+	    tlt_success = forceSendTLT();
+    }
+    
+	  if ((!tlt_success || m_PendingImportant==ImpPendingNormal) && m_txBuffer->Size()) {
+		  std::cerr << "TLT Immediate retransmit failed" << std::endl;
+      // abort();
+	  }
+  } else {
+    m_tlt_send_unit = 1;
+  }
 }
 
 void
 TcpSocketBase::ProcessAck (const SequenceNumber32 &ackNumber, bool scoreboardUpdated,
-                           const SequenceNumber32 &oldHeadSequence)
+                           const SequenceNumber32 &oldHeadSequence, bool withECE)
 {
   NS_LOG_FUNCTION (this << ackNumber << scoreboardUpdated);
   // RFC 6675, Section 5, 2nd paragraph:
@@ -1724,6 +2370,11 @@ TcpSocketBase::ProcessAck (const SequenceNumber32 &ackNumber, bool scoreboardUpd
   bool exitedFastRecovery = false;
   uint32_t oldDupAckCount = m_dupAckCount; // remember the old value
   m_tcb->m_lastAckedSeq = ackNumber; // Update lastAckedSeq
+
+  #if DEBUG_PRINT
+  if(socketId>=0) 
+    std::cerr<< "Flow " << socketId << " : Recv Ack " << ackNumber <<"("  << ", AvailWnd=" << AvailableWindow() <<", Inflight=" << BytesInFlight() << ", cwnd=" << m_tcb->m_cWnd<< ", ssthresh=" << m_tcb->m_ssThresh << std::endl; 
+  #endif
 
   /* In RFC 5681 the definition of duplicate acknowledgment was strict:
    *
@@ -1781,7 +2432,7 @@ TcpSocketBase::ProcessAck (const SequenceNumber32 &ackNumber, bool scoreboardUpd
   else if (ackNumber == oldHeadSequence)
     {
       // DupAck. Artificially call PktsAcked: after all, one segment has been ACKed.
-      m_congestionControl->PktsAcked (m_tcb, 1, m_tcb->m_lastRtt);
+      m_congestionControl->PktsAcked (m_tcb, 1, m_tcb->m_lastRtt, withECE, m_tcb->m_highTxMark, ackNumber);
     }
   else if (ackNumber > oldHeadSequence)
     {
@@ -1790,6 +2441,7 @@ TcpSocketBase::ProcessAck (const SequenceNumber32 &ackNumber, bool scoreboardUpd
       uint32_t bytesAcked = ackNumber - oldHeadSequence;
       uint32_t segsAcked  = bytesAcked / m_tcb->m_segmentSize;
       m_bytesAckedNotProcessed += bytesAcked % m_tcb->m_segmentSize;
+      // printf("SockID=%d, InitialCwnd = %u\n", socketId, m_tcb->m_initialCWnd);
 
       if (m_bytesAckedNotProcessed >= m_tcb->m_segmentSize)
         {
@@ -1807,6 +2459,9 @@ TcpSocketBase::ProcessAck (const SequenceNumber32 &ackNumber, bool scoreboardUpd
       if (!isDupack)
         {
           m_dupAckCount = 0;
+          
+          if(m_tlp_enabled)
+            m_tlp_pto_cnt = 0;
         }
 
       // RFC 6675, Section 5, part (B)
@@ -1835,7 +2490,7 @@ TcpSocketBase::ProcessAck (const SequenceNumber32 &ackNumber, bool scoreboardUpd
               // probably is better to retransmit it
               m_txBuffer->DeleteRetransmittedFlagFromHead ();
             }
-          DoRetransmit (); // Assume the next seq is lost. Retransmit lost packet
+          DoRetransmit (true); // Assume the next seq is lost. Retransmit lost packet
           m_tcb->m_cWndInfl = SafeSubtraction (m_tcb->m_cWndInfl, bytesAcked);
           if (segsAcked >= 1)
             {
@@ -1845,8 +2500,9 @@ TcpSocketBase::ProcessAck (const SequenceNumber32 &ackNumber, bool scoreboardUpd
           // This partial ACK acknowledge the fact that one segment has been
           // previously lost and now successfully received. All others have
           // been processed when they come under the form of dupACKs
-          m_congestionControl->PktsAcked (m_tcb, 1, m_tcb->m_lastRtt);
-          NewAck (ackNumber, m_isFirstPartialAck);
+          m_congestionControl->PktsAcked (m_tcb, 1, m_tcb->m_lastRtt, withECE, m_tcb->m_highTxMark, ackNumber);
+          // NewAck (ackNumber, m_isFirstPartialAck);
+          NewAck (ackNumber, true); // Tcp-Reno-way
 
           if (m_isFirstPartialAck)
             {
@@ -1872,7 +2528,7 @@ TcpSocketBase::ProcessAck (const SequenceNumber32 &ackNumber, bool scoreboardUpd
       // of RecoveryPoint.
       else if (ackNumber < m_recover && m_tcb->m_congState == TcpSocketState::CA_LOSS)
         {
-          m_congestionControl->PktsAcked (m_tcb, segsAcked, m_tcb->m_lastRtt);
+          m_congestionControl->PktsAcked (m_tcb, segsAcked, m_tcb->m_lastRtt, withECE, m_tcb->m_highTxMark, ackNumber);
           m_congestionControl->IncreaseWindow (m_tcb, segsAcked);
 
           NS_LOG_DEBUG (" Cong Control Called, cWnd=" << m_tcb->m_cWnd <<
@@ -1889,13 +2545,30 @@ TcpSocketBase::ProcessAck (const SequenceNumber32 &ackNumber, bool scoreboardUpd
         {
           if (m_tcb->m_congState == TcpSocketState::CA_OPEN)
             {
-              m_congestionControl->PktsAcked (m_tcb, segsAcked, m_tcb->m_lastRtt);
+              m_congestionControl->PktsAcked (m_tcb, segsAcked, m_tcb->m_lastRtt, withECE, m_tcb->m_highTxMark, ackNumber);
+            }
+          else if (m_tcb->m_congState == TcpSocketState::CA_CWR)
+            {
+              if(m_tcb->m_sentCWR && ackNumber > m_tcb->m_CWRSentSeq)
+                {
+                  NS_LOG_DEBUG ("CA_CWR -> OPEN");
+                  m_tcb->m_congState = TcpSocketState::CA_OPEN;
+                  m_tcb->m_sentCWR = false;
+                }
+              m_dupAckCount = 0;
+              if(m_tlp_enabled)
+                m_tlp_pto_cnt = 0;
+              //m_retransOut = 0;
+
+              m_congestionControl->PktsAcked(m_tcb, segsAcked, m_tcb->m_lastRtt, withECE, m_tcb->m_highTxMark, ackNumber);
             }
           else if (m_tcb->m_congState == TcpSocketState::CA_DISORDER)
             {
               if (segsAcked >= oldDupAckCount)
                 {
-                  m_congestionControl->PktsAcked (m_tcb, segsAcked - oldDupAckCount, m_tcb->m_lastRtt);
+                  m_congestionControl->PktsAcked (m_tcb, segsAcked - oldDupAckCount, m_tcb->m_lastRtt, withECE, m_tcb->m_highTxMark, ackNumber);
+                } else {
+                  std::cout << "WHY PKTS_ACKED NOT CALLED?" << std::endl;
                 }
 
               if (!isDupack)
@@ -1930,12 +2603,14 @@ TcpSocketBase::ProcessAck (const SequenceNumber32 &ackNumber, bool scoreboardUpd
               // (which are the ones we have not passed to PktsAcked and that
               // can increase cWnd)
               segsAcked = static_cast<uint32_t>(ackNumber - m_recover) / m_tcb->m_segmentSize;
-              m_congestionControl->PktsAcked (m_tcb, segsAcked, m_tcb->m_lastRtt);
-              m_congestionControl->CwndEvent (m_tcb, TcpSocketState::CA_EVENT_COMPLETE_CWR);
+              m_congestionControl->PktsAcked (m_tcb, segsAcked, m_tcb->m_lastRtt, withECE, m_tcb->m_highTxMark, ackNumber);
+              m_congestionControl->CwndEvent (m_tcb, TcpSocketState::CA_EVENT_COMPLETE_CWR, this);
               m_congestionControl->CongestionStateSet (m_tcb, TcpSocketState::CA_OPEN);
               m_tcb->m_congState = TcpSocketState::CA_OPEN;
               exitedFastRecovery = true;
               m_dupAckCount = 0; // From recovery to open, reset dupack
+              if(m_tlp_enabled)
+                m_tlp_pto_cnt = 0;
 
               NS_LOG_DEBUG (segsAcked << " segments acked in CA_RECOVER, ack of " <<
                             ackNumber << ", exiting CA_RECOVERY -> CA_OPEN");
@@ -1949,7 +2624,7 @@ TcpSocketBase::ProcessAck (const SequenceNumber32 &ackNumber, bool scoreboardUpd
               // can increase cWnd)
               segsAcked = (ackNumber - m_recover) / m_tcb->m_segmentSize;
 
-              m_congestionControl->PktsAcked (m_tcb, segsAcked, m_tcb->m_lastRtt);
+              m_congestionControl->PktsAcked (m_tcb, segsAcked, m_tcb->m_lastRtt, withECE, m_tcb->m_highTxMark, ackNumber);
 
               m_congestionControl->CongestionStateSet (m_tcb, TcpSocketState::CA_OPEN);
               m_tcb->m_congState = TcpSocketState::CA_OPEN;
@@ -1978,6 +2653,15 @@ TcpSocketBase::ProcessAck (const SequenceNumber32 &ackNumber, bool scoreboardUpd
               NewAck (ackNumber, true);
             }
         }
+    }
+
+    if(m_tlp_enabled) {
+      if(m_tlp_ptoEvent.IsRunning()) {
+        NS_ASSERT(m_tlp_pto.GetSeconds());
+        Simulator::Cancel(m_tlp_ptoEvent);
+        m_tlp_ptoEvent = Simulator::Schedule(m_tlp_pto, &TcpSocketBase::PtoTimeout, this);
+        m_tlp_pto_cnt++;
+      }
     }
 }
 
@@ -2043,7 +2727,7 @@ TcpSocketBase::ProcessSynSent (Ptr<Packet> packet, const TcpHeader& tcpHeader)
       /* Check if we received an ECN SYN packet. Change the ECN state of receiver to ECN_IDLE if the traffic is ECN capable and
        * sender has sent ECN SYN packet
        */
-      if (m_ecnMode == EcnMode_t::ClassicEcn && (tcpflags & (TcpHeader::CWR | TcpHeader::ECE)) == (TcpHeader::CWR | TcpHeader::ECE))
+      if (m_ecnMode != EcnMode_t::DCTCP && (tcpflags & (TcpHeader::CWR | TcpHeader::ECE)) == (TcpHeader::CWR | TcpHeader::ECE))
         {
           NS_LOG_INFO ("Received ECN SYN packet");
           SendEmptyPacket (TcpHeader::SYN | TcpHeader::ACK | TcpHeader::ECE);
@@ -2222,7 +2906,8 @@ TcpSocketBase::ProcessWait (Ptr<Packet> packet, const TcpHeader& tcpHeader)
       ReceivedData (packet, tcpHeader);
     }
   else if (tcpflags == TcpHeader::ACK)
-    { // Process the ACK, and if in FIN_WAIT_1, conditionally move to FIN_WAIT_2
+    {
+      // Process the ACK, and if in FIN_WAIT_1, conditionally move to FIN_WAIT_2
       ReceivedAck (packet, tcpHeader);
       if (m_state == FIN_WAIT_1 && m_txBuffer->Size () == 0
           && tcpHeader.GetAckNumber () == m_tcb->m_highTxMark + SequenceNumber32 (1))
@@ -2471,6 +3156,13 @@ TcpSocketBase::SendEmptyPacket (uint8_t flags)
   Ptr<Packet> p = Create<Packet> ();
   TcpHeader header;
   SequenceNumber32 s = m_tcb->m_nextTxSequence;
+  /*uint8_t ECNbits = (m_DCTCP && (m_tcb->m_ecnState != TcpSocketState::ECN_DISABLED)) ? Ipv4Header::ECN_ECT1 : 0;
+
+  if (ECNbits) {
+    SocketIpTosTag ipTosTag;
+    ipTosTag.SetTos(ECNbits);
+  }*/
+  
 
   if (flags & TcpHeader::FIN)
     {
@@ -2482,6 +3174,31 @@ TcpSocketBase::SendEmptyPacket (uint8_t flags)
     }
 
   AddSocketTags (p);
+
+  // TLT
+  if (m_TLT) {
+    TltTag tt;
+    if ((flags & TcpHeader::SYN)) {
+      tt.SetType(TltTag::PACKET_IMPORTANT);
+      p->AddPacketTag(tt);
+    } else if (m_PendingImportantEcho == ImpPendingForce) {
+      TltTag tt;
+      tt.SetType(TltTag::PACKET_IMPORTANT_ECHO_FORCE);
+      p->AddPacketTag(tt);
+      m_PendingImportantEcho = ImpIdle;
+    } else if (m_PendingImportantEcho != ImpIdle) {
+      TltTag tt;
+      tt.SetType(TltTag::PACKET_IMPORTANT_ECHO);
+      p->AddPacketTag(tt);
+      m_PendingImportantEcho = ImpIdle;
+    } else {
+      // Design revision on Aug 31
+      TltTag tt;
+      tt.SetType(TltTag::PACKET_IMPORTANT_CONTROL);
+      p->AddPacketTag(tt);
+    }
+    //NS_ASSERT(m_PendingImportantEcho == ImpIdle);
+  } 
 
   header.SetFlags (flags);
   header.SetSequenceNumber (s);
@@ -2499,8 +3216,13 @@ TcpSocketBase::SendEmptyPacket (uint8_t flags)
   AddOptions (header);
 
   // RFC 6298, clause 2.4
-  m_rto = Max (m_rtt->GetEstimate () + Max (m_clockGranularity, m_rtt->GetVariation () * 4), m_minRto);
-
+  if(m_use_static_rto) {
+    if (m_rto.Get() != m_minRto) {
+      m_rto = m_minRto;
+    }
+  } else {
+    m_rto = Max (m_rtt->GetEstimate () + Max (m_clockGranularity, m_rtt->GetVariation () * 4), m_minRto);
+  }
   uint16_t windowSize = AdvertisedWindowSize ();
   bool hasSyn = flags & TcpHeader::SYN;
   bool hasFin = flags & TcpHeader::FIN;
@@ -2546,6 +3268,7 @@ TcpSocketBase::SendEmptyPacket (uint8_t flags)
 
   if (flags & TcpHeader::ACK)
     { // If sending an ACK, cancel the delay ACK as well
+      m_congestionControl->CwndEvent(m_tcb, TcpSocketState::CA_EVENT_DELAY_ACK_NO_RESERVED, this);
       m_delAckEvent.Cancel ();
       m_delAckCount = 0;
       if (m_highTxAck < header.GetAckNumber ())
@@ -2561,6 +3284,20 @@ TcpSocketBase::SendEmptyPacket (uint8_t flags)
 
   m_txTrace (p, header, this);
 
+          {
+            PfcExperienceTag pet;
+            if (!p->PeekPacketTag(pet))
+            {
+              if(socketId >= 0) {
+                pet.m_socketId = socketId;
+                p->AddPacketTag(pet);
+              } else if (remoteSocketId >= 0) {
+                pet.m_socketId = remoteSocketId;
+                p->AddPacketTag(pet);
+              }
+            }
+          }
+          embed_tft(this, p);
   if (m_endPoint != nullptr)
     {
       m_tcp->SendPacket (p, header, m_endPoint->GetLocalAddress (),
@@ -2829,10 +3566,43 @@ TcpSocketBase::AddSocketTags (const Ptr<Packet> &p) const
 }
 /* Extract at most maxSize bytes from the TxBuffer at sequence seq, add the
     TCP header, and send to TcpL4Protocol */
+
 uint32_t
 TcpSocketBase::SendDataPacket (SequenceNumber32 seq, uint32_t maxSize, bool withAck)
 {
+  return SendDataPacket(seq, maxSize, withAck, false, false);
+}
+uint32_t
+TcpSocketBase::SendDataPacket (SequenceNumber32 seq, uint32_t maxSize, bool withAck, bool fastRetx, bool tltForceRetransmit)
+{
   NS_LOG_FUNCTION (this << seq << maxSize << withAck);
+
+  if(m_TLT && (m_tcb->m_congState == TcpSocketState::CA_RECOVERY) && (m_PendingImportant==ImpPendingNormal) && m_highestImportantAck < seq) {
+    if(!tltForceRetransmit) {
+      // function forceSendTLT will set m_pendingImportant to PendingIdle
+      // forceSendTLT will call SendDataPacket again, but with tltForceRetransmit==true, so there is no possibility of infinite loop
+      uint32_t sz = 0;
+      #if DEBUG_PRINT
+        std::cerr << "Flow " << socketId << " : Try to Intercept force Retransmission TLT here!! origseq=" << seq.GetValue() << std::endl;
+        #endif
+      if(forceSendTLT(&sz, GetSegSize())) {
+        
+      #if DEBUG_PRINT
+        std::cerr << "Flow " << socketId << " : Success in intercepting force Retransmission TLT here!! sz=" << sz << std::endl;
+        #endif
+        // if there was unimportant packet in the m_tlt_unimportant_pkts, we override the behavior of Tcp NewReno
+        return sz;
+      }
+    } else {
+      // this is called SendDataPacket - forceSendTLT - SendDataPacket
+      tltForceRetransmit = false; // no packet class differentiation
+    }
+    
+  #if DEBUG_PRINT
+  } else if (m_TLT && (m_tcb->m_congState == TcpSocketState::CA_RECOVERY) && (m_PendingImportant==ImpPendingNormal) && m_highestImportantAck >= seq) {
+        std::cerr << "Flow " << socketId << " : Not Intercepting force Retransmission TLT here!! origseq=" << seq.GetValue() << std::endl;  
+  #endif
+  }
 
   bool isRetransmission = false;
   if (seq != m_tcb->m_highTxMark)
@@ -2844,30 +3614,36 @@ TcpSocketBase::SendDataPacket (SequenceNumber32 seq, uint32_t maxSize, bool with
   uint32_t sz = p->GetSize (); // Size of packet
   uint8_t flags = withAck ? TcpHeader::ACK : 0;
   uint32_t remainingData = m_txBuffer->SizeFromSequence (seq + SequenceNumber32 (sz));
-
+  m_lastTxSeq = seq;
+  m_lastTxSz = sz;
+  //seq to idx mapping : (seq+sz/1440)
+  while ((int)stat_xmit.size() < (int) ((seq+sz).GetValue()/1440)) {
+    stat_xmit.push_back(Simulator::Now());
+  }
   if (m_tcb->m_pacing)
+  {
+    NS_LOG_INFO ("Pacing is enabled");
+    if (m_pacingTimer.IsExpired ())
     {
-      NS_LOG_INFO ("Pacing is enabled");
-      if (m_pacingTimer.IsExpired ())
-        {
-          NS_LOG_DEBUG ("Current Pacing Rate " << m_tcb->m_currentPacingRate);
-          NS_LOG_DEBUG ("Timer is in expired state, activate it " << m_tcb->m_currentPacingRate.CalculateBytesTxTime (sz));
-          m_pacingTimer.Schedule (m_tcb->m_currentPacingRate.CalculateBytesTxTime (sz));
-        }
-      else
-        {
-          NS_LOG_INFO ("Timer is already in running state");
-        }
+      NS_LOG_DEBUG ("Current Pacing Rate " << m_tcb->m_currentPacingRate);
+      NS_LOG_DEBUG ("Timer is in expired state, activate it " << m_tcb->m_currentPacingRate.CalculateBytesTxTime (sz));
+      m_pacingTimer.Schedule (m_tcb->m_currentPacingRate.CalculateBytesTxTime (sz));
     }
+    else
+    {
+      NS_LOG_INFO ("Timer is already in running state");
+    }
+  }
 
   if (withAck)
     {
+      m_congestionControl->CwndEvent(m_tcb, TcpSocketState::CA_EVENT_DELAY_ACK_NO_RESERVED, this);
       m_delAckEvent.Cancel ();
       m_delAckCount = 0;
     }
 
   // Sender should reduce the Congestion Window as a response to receiver's ECN Echo notification only once per window
-  if (m_tcb->m_ecnState == TcpSocketState::ECN_ECE_RCVD && m_ecnEchoSeq.Get() > m_ecnCWRSeq.Get () && !isRetransmission)
+  /*if (m_ecnMode != EcnMode_t::DCTCP && m_tcb->m_ecnState == TcpSocketState::ECN_ECE_RCVD && m_ecnEchoSeq.Get() > m_ecnCWRSeq.Get () && !isRetransmission)
     {
       NS_LOG_INFO ("Backoff mechanism by reducing CWND  by half because we've received ECN Echo");
       m_tcb->m_cWnd = std::max (m_tcb->m_cWnd.Get () / 2, m_tcb->m_segmentSize);
@@ -2885,12 +3661,30 @@ TcpSocketBase::SendDataPacket (SequenceNumber32 seq, uint32_t maxSize, bool with
           m_tcb->m_congState = TcpSocketState::CA_CWR;
         }
     }
+*/
+  //AddSocketTags (p);
 
+  // XXX If this data packet is not retransmission, set ECT
+  if (m_tcb->m_ecnConn && !isRetransmission) {
+    if (m_tcb->m_queueCWR) {
+        // The congestion control has responeded, mark CWR in TCP header
+        m_tcb->m_queueCWR = false;
+        flags |= TcpHeader::CWR;
+        // Mark the sequence number for CA_CWR to exit
+        m_tcb->m_CWRSentSeq = seq;
+        m_tcb->m_sentCWR = true;
+    }
+  // These are at AddSocketTags
+  //  Ipv4EcnTag ipv4EcnTag;
+  //  ipv4EcnTag.SetEcn(Ipv4Header::ECN_ECT1);
+  // p->AddPacketTag (ipv4EcnTag);
+  }
   AddSocketTags (p);
 
   if (m_closeOnEmpty && (remainingData == 0))
     {
       flags |= TcpHeader::FIN;
+      //std::cout << "CLOSE ON EMPTY " << this << std::endl;
       if (m_state == ESTABLISHED)
         { // On active close: I am the first one to send FIN
           NS_LOG_DEBUG ("ESTABLISHED -> FIN_WAIT_1");
@@ -2918,7 +3712,67 @@ TcpSocketBase::SendDataPacket (SequenceNumber32 seq, uint32_t maxSize, bool with
     }
   header.SetWindowSize (AdvertisedWindowSize ());
   AddOptions (header);
+  //TLT
+  bool markedTLT = false;
+  if (m_TLT && (m_PendingImportant==ImpPendingNormal)) {
+    // now we don't need fastRetx condition anymore
+    if(m_PendingImportant!=ImpPendingNormal && fastRetx) {
+      std::cout << "WARN : Previous Logic used to xmit even if ImpPending was false." << std::endl;
+    } else {
+      m_PendingImportant = ImpIdle;
+    }
+	  TltTag tt;
+    if(OPTIMIZE_LEVEL(6) && tltForceRetransmit) {
+  	  tt.SetType(TltTag::PACKET_IMPORTANT_FORCE);
+    } else {
+	  tt.SetType(TltTag::PACKET_IMPORTANT);
+    }
+    tt.debug_socketId = socketId;
+	  p->AddPacketTag(tt);
+	  m_PendingImportant = ImpIdle;
+    markedTLT = true;
+  // } else if (m_TLT && fastRetx) {
+  //   TltTag tt;
+  //   tt.SetType(TltTag::PACKET_IMPORTANT_FAST_RETRANS);
+  //   tt.debug_socketId = socketId;
+	//   p->AddPacketTag(tt);
+  //   // markedTLT = true;
+  } else if (m_TLT && m_PendingImportant == ImpPendingInitialWindow) {
+    // AvailableWindow has been already reduced here (at CopyFromSequence)
+    // std::cout << "AvailableWindow = " << AvailableWindow() << std::endl;
+    SequenceNumber32 next;
+    bool enableRule3 = m_sackEnabled && m_tcb->m_congState == TcpSocketState::CA_RECOVERY;
+    if (AvailableWindow() == 0 || !m_txBuffer->NextSeg (&next, enableRule3))
+    {
+      TltTag tt;
+      tt.SetType(TltTag::PACKET_IMPORTANT);
+      tt.debug_socketId = socketId;
+	    p->AddPacketTag(tt);
+	    m_PendingImportant = ImpIdle;
+      markedTLT = true;
+    }
+  } else if (m_TLT && m_PendingImportantEcho != ImpIdle) {
+    std::cout << "I must've transmit ImpEcho." << std::endl;
+  } else {
+    TltTag tt;
+    tt.SetType(TltTag::PACKET_NOT_IMPORTANT);
+    tt.debug_socketId = socketId;
+	  p->AddPacketTag(tt);
+  }
+  #if DEBUG_PRINT
+  if(!markedTLT) {
+    std::cerr<< "Flow " << socketId << " : Xmit Uimp packet " << seq << "-" << (seq+sz) << ", AvailWnd=" << AvailableWindow() <<", Inflight=" << BytesInFlight() << ", cwnd=" << m_tcb->m_cWnd<< ", ssthresh=" << m_tcb->m_ssThresh << std::endl; 
+  } else {
+    std::cerr<< "Flow " << socketId << " : Xmit IMP  packet " << seq << "-" << (seq+sz) << ", AvailWnd=" << AvailableWindow() <<", Inflight=" << BytesInFlight() << ", cwnd=" << m_tcb->m_cWnd<< ", ssthresh=" << m_tcb->m_ssThresh << std::endl; 
+  }
+  #endif
 
+  if(markedTLT) {
+    statImpDataTcp[m_tcb->m_congState] += sz;
+
+  } else {
+    statUimpDataTcp[m_tcb->m_congState] += sz;
+  }
   if (m_retxEvent.IsExpired ())
     {
       // Schedules retransmit timeout. m_rto should be already doubled.
@@ -2929,7 +3783,26 @@ TcpSocketBase::SendDataPacket (SequenceNumber32 seq, uint32_t maxSize, bool with
       m_retxEvent = Simulator::Schedule (m_rto, &TcpSocketBase::ReTxTimeout, this);
     }
 
+  if(m_tlp_enabled) {
+    SchedulePto(remainingData);
+  }
+
   m_txTrace (p, header, this);
+  {
+    PfcExperienceTag pet;
+    if (!p->PeekPacketTag(pet))
+    {
+      if(socketId >= 0) {
+        pet.m_socketId = socketId;
+        p->AddPacketTag(pet);
+      } else if (remoteSocketId >= 0) {
+        pet.m_socketId = remoteSocketId;
+        p->AddPacketTag(pet);
+      }
+    }
+  }
+
+  embed_tft(this, p);
 
   if (m_endPoint)
     {
@@ -2948,6 +3821,7 @@ TcpSocketBase::SendDataPacket (SequenceNumber32 seq, uint32_t maxSize, bool with
                     ". Header " << header);
     }
 
+// BYPASS_TRANSMISSION:
   UpdateRttHistory (seq, sz, isRetransmission);
 
   // Update bytes sent during recovery phase
@@ -2964,7 +3838,154 @@ TcpSocketBase::SendDataPacket (SequenceNumber32 seq, uint32_t maxSize, bool with
     }
   // Update highTxMark
   m_tcb->m_highTxMark = std::max (seq + sz, m_tcb->m_highTxMark.Get ());
+
+  // TLT store last byte to force retransmit
+  //if(!isRetransmission && sz > 0) {
+  //  m_tlt_last_seq = seq ; // + (sz - 1);
+  //}
+  // TLT : retransmit the last packet again, which might be retransmitted one
+  /*if (sz > 0 && !markedTLT) {
+    m_tlt_last_seq = seq;
+    m_tlt_last_sz = sz;
+    if(isRetransmission) std::cout << "TLT FR will packet being retransmitted" << std::endl;
+  }*/
+  if (sz > 0 && !markedTLT) {
+    m_tlt_unimportant_pkts.socketId = socketId;
+    m_tlt_unimportant_pkts.push(seq, sz); // linked list implementation of blocks
+   
+    m_tlt_unimportant_pkts_prev_round->socketId = socketId;
+    m_tlt_unimportant_pkts_current_round->socketId = socketId;
+    m_tlt_unimportant_pkts_current_round->push(seq, sz);
+  }
+  txTotalPkts += 1;
+  txTotalBytes += sz;
+  if (markedTLT)
+    txTotalBytesImp += sz;
+  else
+    txTotalBytesUimp += sz;
+    
+  m_tlt_unimportant_flag_debug = true;
+  if(firstUsedTcp.GetSeconds() == 0 && sz > 0 && seq.GetValue() > 0){
+    firstUsedTcp = Simulator::Now();
+  }
   return sz;
+}
+
+void
+TcpSocketBase::SchedulePto (uint32_t remainingData)
+{
+  
+  if (m_tlp_enabled) {
+    Time rtt = m_rtt->GetEstimate();
+    Time pto = m_rto.Get();
+    if (BytesInFlight() > GetSegSize())
+      pto = std::max(2 * rtt, MicroSeconds(10)); // this must be adjusted for DCN, changing 
+    else if (BytesInFlight() > 0) {
+      //pto = max(2 * rtt, 1.5 * rtt + m_delAckTimeout); // this is 200ms; must be adjusted for DCN
+      pto = 2 * rtt; //assume no delayed ACK here
+    }
+    pto = std::min(pto, m_rto.Get());
+    if ((m_tcb->m_congState == TcpSocketState::CA_OPEN) &&
+        (AvailableWindow() < GetSegSize() || remainingData == 0)&&
+        m_tlp_pto_cnt < 1 &&
+        m_sackEnabled)
+    {
+      m_tlp_pto = pto;
+      if(m_tlp_ptoEvent.IsRunning())
+        Simulator::Cancel(m_tlp_ptoEvent);
+      m_tlp_ptoEvent = Simulator::Schedule(m_tlp_pto, &TcpSocketBase::PtoTimeout, this);
+      m_tlp_pto_cnt++;
+    }
+  }  
+}
+
+void
+TcpSocketBase::PtoTimeout (void) 
+{
+  NS_ASSERT(m_tlp_enabled);
+
+  TcpHeader tcpHeader;
+  Ptr<Packet> p;
+  uint32_t remainingData = 0;
+  // if new segment exists
+  SequenceNumber32 seq = m_tcb->m_nextTxSequence;
+  remainingData = m_txBuffer->SizeFromSequence (seq);
+  
+  if (remainingData && AvailableWindow() >= std::min(remainingData, GetSegSize())) {
+    // transmit new segment
+    // packets_out++ (of the SACK pipe)
+    uint32_t len = std::min(remainingData, GetSegSize());
+    p = m_txBuffer->CopyFromSequence(len, seq); // CopyFromSequence will increase packets_out
+    tcpHeader.SetSequenceNumber (seq);
+    remainingData = m_txBuffer->SizeFromSequence (seq + len);
+  
+  } else {
+    if(m_lastTxSeq < m_txBuffer->HeadSequence())
+      return;
+    // retransmit the last segment
+    NS_ASSERT(m_lastTxSz);
+    p = m_txBuffer->CopyFromSequence(m_lastTxSz, m_lastTxSeq); // CopyFromSequence will increase packets_out
+    tcpHeader.SetSequenceNumber (m_lastTxSeq);
+    remainingData = m_txBuffer->SizeFromSequence (m_lastTxSeq + SequenceNumber32 (m_lastTxSz));
+  }
+
+  uint8_t flags = TcpHeader::ACK;
+  
+  if (m_closeOnEmpty && (remainingData == 0))
+  {
+    flags |= TcpHeader::FIN;
+    if (m_state == ESTABLISHED)
+      { // On active close: I am the first one to send FIN
+        NS_LOG_DEBUG ("ESTABLISHED -> FIN_WAIT_1");
+        m_state = FIN_WAIT_1;
+      }
+    else if (m_state == CLOSE_WAIT)
+      { // On passive close: Peer sent me FIN already
+        NS_LOG_DEBUG ("CLOSE_WAIT -> LAST_ACK");
+        m_state = LAST_ACK;
+      }
+  }
+  tcpHeader.SetFlags (flags);
+  tcpHeader.SetAckNumber (m_rxBuffer->NextRxSequence ());
+  tcpHeader.SetWindowSize (AdvertisedWindowSize ());
+  if (m_endPoint != nullptr)
+    {
+      tcpHeader.SetSourcePort (m_endPoint->GetLocalPort ());
+      tcpHeader.SetDestinationPort (m_endPoint->GetPeerPort ());
+    }
+  else
+    {
+      tcpHeader.SetSourcePort (m_endPoint6->GetLocalPort ());
+      tcpHeader.SetDestinationPort (m_endPoint6->GetPeerPort ());
+    }
+  AddOptions (tcpHeader);
+  NS_ASSERT(p);
+
+  m_txTrace (p, tcpHeader, this);
+  {
+    PfcExperienceTag pet;
+    if (!p->PeekPacketTag(pet))
+    {
+      if(socketId >= 0) {
+        pet.m_socketId = socketId;
+        p->AddPacketTag(pet);
+      } else if (remoteSocketId >= 0) {
+        pet.m_socketId = remoteSocketId;
+        p->AddPacketTag(pet);
+      }
+    }
+  }
+  embed_tft(this, p);
+  if (m_endPoint != nullptr)
+    {
+      m_tcp->SendPacket (p, tcpHeader, m_endPoint->GetLocalAddress (),
+                         m_endPoint->GetPeerAddress (), m_boundnetdevice);
+    }
+  else
+    {
+      m_tcp->SendPacket (p, tcpHeader, m_endPoint6->GetLocalAddress (),
+                         m_endPoint6->GetPeerAddress (), m_boundnetdevice);
+    }
 }
 
 void
@@ -3015,6 +4036,14 @@ TcpSocketBase::SendPendingData (bool withAck)
   // segments as follows:
   // (NOTE: We check > 0, and do the checks for segmentSize in the following
   // else branch to control silly window syndrome and Nagle)
+  
+
+  
+    // if(socketId >= 620 && socketId < 630) {
+    //   printf("Increasing window, SockID=%d, availableWindow=%u, withAck=%d, rWnd=%u, cWnd=%u, inf=%u, %s\n", 
+    //   socketId, availableWindow, withAck, m_rWnd.Get (), m_tcb->m_cWnd.Get (), BytesInFlight()
+    //   ,TcpSocketState::TcpCongStateName[m_tcb->m_congState]);
+    // }
   while (availableWindow > 0)
     {
       if (m_tcb->m_pacing)
@@ -3092,7 +4121,7 @@ TcpSocketBase::SendPendingData (bool withAck)
             }
           if (m_tcb->m_bytesInFlight.Get () == 0)
             {
-              m_congestionControl->CwndEvent (m_tcb, TcpSocketState::CA_EVENT_TX_START);
+              m_congestionControl->CwndEvent (m_tcb, TcpSocketState::CA_EVENT_TX_START, this);
             }
           uint32_t sz = SendDataPacket (m_tcb->m_nextTxSequence, s, withAck);
           m_tcb->m_nextTxSequence += sz;
@@ -3230,10 +4259,47 @@ TcpSocketBase::ReceivedData (Ptr<Packet> p, const TcpHeader& tcpHeader)
   NS_LOG_DEBUG ("Data segment, seq=" << tcpHeader.GetSequenceNumber () <<
                 " pkt size=" << p->GetSize () );
 
+#if DEBUG_PRINT
+      TltTag tlt;
+      if (p->PeekPacketTag(tlt)) {
+        std::cerr<< "Flow " << (int)(tlt.debug_socketId) << " : Recv valid TCP Data Seq=" <<  tcpHeader.GetSequenceNumber() << ", state=" << TcpStateName[m_state] << std::endl;
+      }
+      #endif
+
+    // XXX ECN Support We should set the ECE flag in TCP if there is CE in IP header
+  if (m_tcb->m_ecnConn) // First, the connection should be ECN capable
+  {
+    Ipv4EcnTag ipv4EcnTag;
+    bool found = p->RemovePacketTag(ipv4EcnTag);
+    if (found && ipv4EcnTag.GetEcn() == Ipv4Header::ECN_NotECT
+        && m_tcb->m_ecnSeen) // We have seen ECN before
+    {
+      NS_LOG_LOGIC (this << " Received Not ECT packet but we have seen ecn, maybe retransmission");
+    }
+    if (found && ipv4EcnTag.GetEcn() == Ipv4Header::ECN_ECT1)
+    {
+      NS_LOG_LOGIC (this << " Received ECT1, notify the congestion control algorithm of the non congestion");
+      m_tcb->m_ecnSeen = true;
+      m_congestionControl->CwndEvent(m_tcb, TcpSocketState::CA_EVENT_ECN_NO_CE, this);
+    }
+    if (found && ipv4EcnTag.GetEcn() == Ipv4Header::ECN_CE)
+    {
+      NS_LOG_LOGIC (this << " Received CE, notify the congestion control algorithm of the congestion");
+      m_tcb->m_demandCWR = true;
+      m_tcb->m_ecnSeen = true;
+      m_congestionControl->CwndEvent(m_tcb, TcpSocketState::CA_EVENT_ECN_IS_CE, this);
+    }
+  }
+
+  // To check total spurious retx, count rx bytes
+  rxTotalBytes += p->GetSize();
   // Put into Rx buffer
   SequenceNumber32 expectedSeq = m_rxBuffer->NextRxSequence ();
   if (!m_rxBuffer->Add (p, tcpHeader))
     { // Insert failed: No data or RX buffer full
+    #if DEBUG_PRINT
+      std::cerr<< "Flow " << (int)(tlt.debug_socketId) << " : Recv, but insert fail : Seq=" <<  tcpHeader.GetSequenceNumber() << ", state=" << TcpStateName[m_state] << std::endl;
+      #endif
       if (m_tcb->m_ecnState == TcpSocketState::ECN_CE_RCVD || m_tcb->m_ecnState == TcpSocketState::ECN_SENDING_ECE)
         {
           SendEmptyPacket (TcpHeader::ACK | TcpHeader::ECE);
@@ -3262,6 +4328,9 @@ TcpSocketBase::ReceivedData (Ptr<Packet> p, const TcpHeader& tcpHeader)
       // invoke peer close procedure
       if (m_rxBuffer->Finished () && (tcpHeader.GetFlags () & TcpHeader::FIN) == 0)
         {
+           #if DEBUG_PRINT
+      std::cerr<< "Flow " << (int)(tlt.debug_socketId) << " : Recv, DopeerClose : Seq=" <<  tcpHeader.GetSequenceNumber() << ", state=" << TcpStateName[m_state] << std::endl;
+      #endif
           DoPeerClose ();
           return;
         }
@@ -3269,7 +4338,10 @@ TcpSocketBase::ReceivedData (Ptr<Packet> p, const TcpHeader& tcpHeader)
   // Now send a new ACK packet acknowledging all received and delivered data
   if (m_rxBuffer->Size () > m_rxBuffer->Available () || m_rxBuffer->NextRxSequence () > expectedSeq + p->GetSize ())
     { // A gap exists in the buffer, or we filled a gap: Always ACK
-      m_congestionControl->CwndEvent (m_tcb, TcpSocketState::CA_EVENT_NON_DELAYED_ACK);
+      m_congestionControl->CwndEvent (m_tcb, TcpSocketState::CA_EVENT_NON_DELAYED_ACK, this);
+       #if DEBUG_PRINT
+      std::cerr<< "Flow " << (int)(tlt.debug_socketId) << " : Recv, sending ACK : Seq=" <<  tcpHeader.GetSequenceNumber() << ", state=" << TcpStateName[m_state] << std::endl;
+      #endif
       if (m_tcb->m_ecnState == TcpSocketState::ECN_CE_RCVD || m_tcb->m_ecnState == TcpSocketState::ECN_SENDING_ECE)
         {
           SendEmptyPacket (TcpHeader::ACK | TcpHeader::ECE);
@@ -3283,25 +4355,41 @@ TcpSocketBase::ReceivedData (Ptr<Packet> p, const TcpHeader& tcpHeader)
     }
   else
     { // In-sequence packet: ACK if delayed ack count allows
+     #if DEBUG_PRINT
+      std::cerr<< "Flow " << (int)(tlt.debug_socketId) << " : Recv, checking delack : Seq=" <<  tcpHeader.GetSequenceNumber() << ", state=" << TcpStateName[m_state] << std::endl;
+      #endif
       if (++m_delAckCount >= m_delAckMaxCount)
         {
           m_delAckEvent.Cancel ();
           m_delAckCount = 0;
-          m_congestionControl->CwndEvent (m_tcb, TcpSocketState::CA_EVENT_NON_DELAYED_ACK);
+          m_congestionControl->CwndEvent (m_tcb, TcpSocketState::CA_EVENT_NON_DELAYED_ACK, this);
           if (m_tcb->m_ecnState == TcpSocketState::ECN_CE_RCVD || m_tcb->m_ecnState == TcpSocketState::ECN_SENDING_ECE)
             {
               NS_LOG_DEBUG("Congestion algo " << m_congestionControl->GetName ());
+              #if DEBUG_PRINT
+      std::cerr<< "Flow " << (int)(tlt.debug_socketId) << " : Recv, sending del+ack+ecn : Seq=" <<  tcpHeader.GetSequenceNumber() << ", state=" << TcpStateName[m_state] << std::endl;
+      #endif
               SendEmptyPacket (TcpHeader::ACK | TcpHeader::ECE);
               NS_LOG_DEBUG (TcpSocketState::EcnStateName[m_tcb->m_ecnState] << " -> ECN_SENDING_ECE");
               m_tcb->m_ecnState = TcpSocketState::ECN_SENDING_ECE;
             }
           else
             {
+              #if DEBUG_PRINT
+      std::cerr<< "Flow " << (int)(tlt.debug_socketId) << " : Recv, sending del+ack : Seq=" <<  tcpHeader.GetSequenceNumber() << ", state=" << TcpStateName[m_state] << std::endl;
+      #endif
               SendEmptyPacket (TcpHeader::ACK);
             }
         }
       else if (m_delAckEvent.IsExpired ())
         {
+          if (m_PendingImportant == ImpPendingNormal)
+            m_PendingImportant = ImpScheduled;
+          if (m_PendingImportantEcho == ImpPendingNormal)
+            m_PendingImportantEcho = ImpScheduled;
+          // TODO : skipping delayed ack implementation for Optimization 6 (Optimization might not work when delayed ack exists)
+          if (m_PendingImportantEcho == ImpPendingForce)
+            m_PendingImportantEcho = ImpScheduled;
           m_delAckEvent = Simulator::Schedule (m_delAckTimeout,
                                                &TcpSocketBase::DelAckTimeout, this);
           NS_LOG_LOGIC (this << " scheduled delayed ACK at " <<
@@ -3354,17 +4442,120 @@ TcpSocketBase::EstimateRtt (const TcpHeader& tcpHeader)
         }
       m_history.pop_front (); // Remove
     }
-
+#if 0
   if (!m.IsZero ())
     {
       m_rtt->Measurement (m);                // Log the measurement
       // RFC 6298, clause 2.4
-      m_rto = Max (m_rtt->GetEstimate () + Max (m_clockGranularity, m_rtt->GetVariation () * 4), m_minRto);
+      if(m_use_static_rto) {
+        if (m_rto.Get() != m_minRto) {
+          // printf("Setting m_rto to minrto, %lf <- %lf\n", m_rto.Get().GetSeconds(), m_minRto.GetSeconds());
+          m_rto = m_minRto;
+          }
+      } else {
+        m_rto = Max (m_rtt->GetEstimate () + Max (m_clockGranularity, m_rtt->GetVariation () * 4), m_minRto);
+      }
+      // printf("RTT estimate %luus, RTTVar %luus, minRTO %luus, m_rto %luus\n", m_rtt->GetEstimate ().GetMicroSeconds(), m_rtt->GetVariation ().GetMicroSeconds(), m_minRto.GetMicroSeconds(), m_rto.Get().GetMicroSeconds());
+      // fflush(stdout);
       m_tcb->m_lastRtt = m_rtt->GetEstimate ();
       m_tcb->m_minRtt = std::min (m_tcb->m_lastRtt.Get (), m_tcb->m_minRtt);
       NS_LOG_INFO (this << m_tcb->m_lastRtt << m_tcb->m_minRtt);
     }
 }
+
+#else
+  if (!m.IsZero ())
+    {
+      
+      m_rtt->Measurement (m);                // Log the measurement
+      Time cal_rto;
+      // RFC 6298, clause 2.4
+      if(m_use_static_rto) {
+        if (m_rto.Get() != m_minRto) {
+          // printf("Setting m_rto to minrto, %lf <- %lf\n", m_rto.Get().GetSeconds(), m_minRto.GetSeconds());
+          m_rto = m_minRto;
+          }
+      } else {
+        cal_rto = m_rtt->GetEstimate() + Max(m_clockGranularity, m_rtt->GetVariation() * 4);
+        m_rto = Max(cal_rto, m_minRto);
+        if (cal_rto.GetSeconds() > 2 && m_stat_rto_burst_measure) {
+          m_stat_rto_burst_measure = false;
+        }
+        if (cal_rto.GetSeconds() > m_stat_max_rto_burst.GetSeconds() && m_stat_rto_burst_measure)
+        {
+          m_stat_max_rto_burst = cal_rto;
+        }
+      }
+
+      int32_t flowid = -1;
+      if (socketId >= 0)
+      {
+        // I am the sender
+        flowid = socketId;
+      }
+      else if (m_recent_tft.m_socketId >= 0)
+      {
+        flowid = m_recent_tft.m_socketId;
+      }
+      else
+      {
+        std::cerr << "I don't know who I am..." << std::endl;
+        // abort();
+      }
+
+      if(((cal_rto.GetMicroSeconds() >= CDF_MAX) ? (CDF_MAX/CDF_GRAN - 1) : (cal_rto.GetMicroSeconds() / CDF_GRAN)) == 0) {
+        // abort();
+      }
+      unsigned rto_per_rtt_scaled = m.GetMicroSeconds() > 0 ? (unsigned)(((double)cal_rto.GetSeconds()/m.GetSeconds())*CDF_RATIO_GRAN) : 0;
+
+      if (flowid >= 0 && flowid >= num_background_flow)
+      {
+        // foreground
+        cdf_rtt_fg[(m.GetMicroSeconds() >= CDF_MAX) ? (CDF_MAX/CDF_GRAN - 1) : (m.GetMicroSeconds() / CDF_GRAN)]++;
+        cdf_rto_fg[(cal_rto.GetMicroSeconds() >= CDF_MAX) ? (CDF_MAX/CDF_GRAN - 1) : (cal_rto.GetMicroSeconds() / CDF_GRAN)]++;
+        if(rto_per_rtt_scaled > 0)
+          cdf_rtoperrtt_fg[(rto_per_rtt_scaled >= CDF_RATIO_MAX * CDF_RATIO_GRAN) ? (CDF_RATIO_MAX * CDF_RATIO_GRAN - 1) : rto_per_rtt_scaled]++;
+      }
+      else
+      {
+        // background
+        cdf_rtt_bg[(m.GetMicroSeconds() >= CDF_MAX) ? (CDF_MAX/CDF_GRAN - 1) : (m.GetMicroSeconds() / CDF_GRAN)]++;
+        cdf_rto_bg[(cal_rto.GetMicroSeconds() >= CDF_MAX) ? (CDF_MAX/CDF_GRAN - 1) : (cal_rto.GetMicroSeconds() / CDF_GRAN)]++;
+        
+        if(rto_per_rtt_scaled > 0)
+          cdf_rtoperrtt_bg[(rto_per_rtt_scaled >= CDF_RATIO_MAX * CDF_RATIO_GRAN) ? (CDF_RATIO_MAX * CDF_RATIO_GRAN - 1) : rto_per_rtt_scaled]++;
+      }
+
+      if (!this->m_stat_rto_measure && m_stat_rto_measure_remainder > 0) {
+        m_stat_rto_measure_remainder--;
+        this->m_stat_rto_measure = true;
+      }
+      // if(!m_prev_m.IsZero ()) {
+      //   double rttspike = m.GetSeconds() - m_prev_m.GetSeconds();
+      //   if (rttspike > max_rto_burst) {
+      //     max_rto_burst = rttspike;
+      //     max_rto_burst_item = this;
+      //   } 
+      // }
+      m_prev_m = m;
+
+      // if (this->m_stat_rto_measure)
+      // {
+        /*m_stat_rto_time.push_back(std::pair<Time, std::pair<Time, Time>>(Simulator::Now(), std::pair<Time, Time>(m, cal_rto)));
+        if(m_stat_rto_time.size() > max_rtt_measure) {
+          max_rtt_measure = m_stat_rto_time.size();
+          max_rtt_measure_item = this;
+        }
+        stat_max_rtt_record[this] = std::pair<double, unsigned int>(m_stat_max_rto_burst.GetSeconds(), m_stat_rto_time.size());*/
+        // }
+        // printf("RTT estimate %luus, RTTVar %luus, minRTO %luus, m_rto %luus\n", m_rtt->GetEstimate ().GetMicroSeconds(), m_rtt->GetVariation ().GetMicroSeconds(), m_minRto.GetMicroSeconds(), m_rto.Get().GetMicroSeconds());
+        // fflush(stdout);
+        m_tcb->m_lastRtt = m_rtt->GetEstimate();
+        m_tcb->m_minRtt = std::min(m_tcb->m_lastRtt.Get(), m_tcb->m_minRtt);
+        NS_LOG_INFO(this << m_tcb->m_lastRtt << m_tcb->m_minRtt);
+    }
+}
+#endif
 
 // Called by the ReceivedAck() when new ACK received and by ProcessSynRcvd()
 // when the three-way handshake completed. This cancels retransmission timer
@@ -3373,7 +4564,7 @@ void
 TcpSocketBase::NewAck (SequenceNumber32 const& ack, bool resetRTO)
 {
   NS_LOG_FUNCTION (this << ack);
-
+  
   // Reset the data retransmission count. We got a new ACK!
   m_dataRetrCount = m_dataRetries;
 
@@ -3384,12 +4575,22 @@ TcpSocketBase::NewAck (SequenceNumber32 const& ack, bool resetRTO)
       m_retxEvent.Cancel ();
       // On receiving a "New" ack we restart retransmission timer .. RFC 6298
       // RFC 6298, clause 2.4
-      m_rto = Max (m_rtt->GetEstimate () + Max (m_clockGranularity, m_rtt->GetVariation () * 4), m_minRto);
+      if(m_use_static_rto) {
+        if (m_rto.Get() != m_minRto)
+          m_rto = m_minRto;
+      } else {
+        m_rto = Max (m_rtt->GetEstimate () + Max (m_clockGranularity, m_rtt->GetVariation () * 4), m_minRto);
+      }
 
       NS_LOG_LOGIC (this << " Schedule ReTxTimeout at time " <<
                     Simulator::Now ().GetSeconds () << " to expire at time " <<
                     (Simulator::Now () + m_rto.Get ()).GetSeconds ());
       m_retxEvent = Simulator::Schedule (m_rto, &TcpSocketBase::ReTxTimeout, this);
+    } else {
+      
+      #if DEBUG_PRINT
+      std::cerr << "Flow " << socketId << " : No Reset RTO" << std::endl;
+      #endif
     }
 
   // Note the highest ACK and tell app to send more
@@ -3406,18 +4607,28 @@ TcpSocketBase::NewAck (SequenceNumber32 const& ack, bool resetRTO)
     }
   if (m_txBuffer->Size () == 0 && m_state != FIN_WAIT_1 && m_state != CLOSING)
     { // No retransmit timer if no data to retransmit
-      NS_LOG_LOGIC (this << " Cancelled ReTxTimeout event which was set to expire at " <<
-                    (Simulator::Now () + Simulator::GetDelayLeft (m_retxEvent)).GetSeconds ());
+    #if DEBUG_PRINT
+      std::cerr << "Flow " << socketId << " : " << this << " Cancelled ReTxTimeout event which was set to expire at " <<
+                    (Simulator::Now () + Simulator::GetDelayLeft (m_retxEvent)).GetSeconds () << std::endl;
+                    #endif
       m_retxEvent.Cancel ();
     }
 }
-
 // Retransmit timeout
 void
 TcpSocketBase::ReTxTimeout ()
 {
   NS_LOG_FUNCTION (this);
-  NS_LOG_LOGIC (this << " ReTxTimeout Expired at time " << Simulator::Now ().GetSeconds ());
+  // std::cout << this << " ReTxTimeout Expired at time " << Simulator::Now ().GetSeconds () << std::endl;
+  if(socketId >= 0 && m_txBuffer->Size() > 0) {
+  ++reTxTimeoutCnt;
+  ++rtoPerFlow;
+  #if DEBUG_PRINT
+  std::cerr << "WARNING : Must not have timeout!! SocketId=" << socketId << std::endl;
+  std::cerr << "Flow " << socketId << " : WARNING : Must not have timeout!! Time:" << (((double)Simulator::Now().GetMilliSeconds())/1000.) << std::endl;
+  #endif
+  }
+  //printf("%.8lf\tRETX_TIMEOUT\t%p\t%u\n", Simulator::Now().GetSeconds(), this, reTxTimeoutCnt);
   // If erroneous timeout in closed/timed-wait state, just return
   if (m_state == CLOSED || m_state == TIME_WAIT)
     {
@@ -3509,7 +4720,12 @@ TcpSocketBase::ReTxTimeout ()
 
   // RFC 6298, clause 2.5, double the timer
   Time doubledRto = m_rto + m_rto;
-  m_rto = Min (doubledRto, Time::FromDouble (60,  Time::S));
+  if(m_use_static_rto) {
+    if (m_rto.Get() != m_minRto)
+      m_rto = m_minRto;
+  } else {
+    m_rto = Min (doubledRto, Time::FromDouble (60,  Time::S));
+  }
 
   // Empty RTT history
   m_history.clear ();
@@ -3527,7 +4743,7 @@ TcpSocketBase::ReTxTimeout ()
   // Cwnd set to 1 MSS
   m_tcb->m_cWnd = m_tcb->m_segmentSize;
   m_tcb->m_cWndInfl = m_tcb->m_cWnd;
-  m_congestionControl->CwndEvent (m_tcb, TcpSocketState::CA_EVENT_LOSS);
+  m_congestionControl->CwndEvent (m_tcb, TcpSocketState::CA_EVENT_LOSS, this);
   m_congestionControl->CongestionStateSet (m_tcb, TcpSocketState::CA_LOSS);
   m_tcb->m_congState = TcpSocketState::CA_LOSS;
 
@@ -3552,7 +4768,7 @@ void
 TcpSocketBase::DelAckTimeout (void)
 {
   m_delAckCount = 0;
-  m_congestionControl->CwndEvent (m_tcb, TcpSocketState::CA_EVENT_DELAYED_ACK);
+  m_congestionControl->CwndEvent (m_tcb, TcpSocketState::CA_EVENT_DELAYED_ACK, this);
   if (m_tcb->m_ecnState == TcpSocketState::ECN_CE_RCVD || m_tcb->m_ecnState == TcpSocketState::ECN_SENDING_ECE)
     {
       SendEmptyPacket (TcpHeader::ACK | TcpHeader::ECE);
@@ -3618,10 +4834,25 @@ TcpSocketBase::PersistTimeout ()
     }
   m_txTrace (p, tcpHeader, this);
 
-  if (m_endPoint != nullptr)
-    {
-      m_tcp->SendPacket (p, tcpHeader, m_endPoint->GetLocalAddress (),
-                         m_endPoint->GetPeerAddress (), m_boundnetdevice);
+          {
+            PfcExperienceTag pet;
+            if (!p->PeekPacketTag(pet))
+            {
+              if(socketId >= 0) {
+                pet.m_socketId = socketId;
+                p->AddPacketTag(pet);
+              } else if (remoteSocketId >= 0) {
+                pet.m_socketId = remoteSocketId;
+                p->AddPacketTag(pet);
+              }
+            }
+          }
+
+          embed_tft(this, p);
+          if (m_endPoint != nullptr)
+          {
+            m_tcp->SendPacket (p, tcpHeader, m_endPoint->GetLocalAddress (),
+                              m_endPoint->GetPeerAddress (), m_boundnetdevice);
     }
   else
     {
@@ -3637,6 +4868,11 @@ TcpSocketBase::PersistTimeout ()
 
 void
 TcpSocketBase::DoRetransmit ()
+{ 
+  DoRetransmit(false);
+}
+void
+TcpSocketBase::DoRetransmit (bool fastRetx)
 {
   NS_LOG_FUNCTION (this);
   bool res;
@@ -3654,10 +4890,13 @@ TcpSocketBase::DoRetransmit ()
     }
   NS_ASSERT (m_sackEnabled || seq == m_txBuffer->HeadSequence ());
 
+  #if DEBUG_PRINT
+  std::cerr << "Flow " << socketId << " : Fast Retransmission=" << seq.GetValue() << std::endl;
+  #endif
   NS_LOG_INFO ("Retransmitting " << seq);
   // Update the trace and retransmit the segment
   m_tcb->m_nextTxSequence = seq;
-  uint32_t sz = SendDataPacket (m_tcb->m_nextTxSequence, m_tcb->m_segmentSize, true);
+  uint32_t sz = SendDataPacket (m_tcb->m_nextTxSequence, m_tcb->m_segmentSize, true, fastRetx, false);
 
   NS_ASSERT (sz > 0);
 }
@@ -3946,6 +5185,11 @@ TcpSocketBase::ProcessOptionSack (const Ptr<const TcpOption> option)
 
   Ptr<const TcpOptionSack> s = DynamicCast<const TcpOptionSack> (option);
   TcpOptionSack::SackList list = s->GetSackList ();
+  if(m_TLT) {
+    m_tlt_unimportant_pkts.updateSack(list);
+    m_tlt_unimportant_pkts_prev_round->updateSack(list);
+    m_tlt_unimportant_pkts_current_round->updateSack(list);
+  }
   return m_txBuffer->Update (list);
 }
 
@@ -4234,6 +5478,221 @@ TcpSocketBase::SetEcn (EcnMode_t ecnMode)
 {
   NS_LOG_FUNCTION (this);
   m_ecnMode = ecnMode;
+}
+
+void
+TcpSocketBase::initTLT() {
+	// initialize TLT
+	m_PendingImportant = ImpPendingInitialWindow;
+	m_PendingImportantEcho = ImpIdle;
+}
+
+
+bool
+TcpSocketBase::forceSendTLT() {
+  return forceSendTLT(nullptr, m_tlt_send_unit);
+}
+bool
+TcpSocketBase::forceSendTLT(uint32_t *pSize, uint32_t tlt_send_unit) {
+  //return false;
+  //#if 0
+  if (!m_TLT)
+    return false;
+	if (m_txBuffer->Size() == 0) {
+		return false;                           // Nothing to send
+
+	}
+
+
+	if (m_endPoint == 0 && m_endPoint6 == 0) {
+		NS_LOG_INFO("TcpSocketBase::SendPendingData: No endpoint; m_shutdownSend=" << m_shutdownSend);
+		return false; // Is this the right way to handle this condition?
+	}
+	uint32_t nPacketsSent = 0;
+  uint32_t availSz = 0;
+  if (!OPTIMIZE_LEVEL(9)) {
+    if (m_tlt_unimportant_pkts.size() == 0) {
+      std::cerr << "WARNING : No Data to Force Retransmit : Must not reach here!! SocketId=" << socketId << std::endl;
+      abort();
+      return false;
+    }
+  } else {
+    if (m_tlt_unimportant_pkts.size() == 0 && (m_tlt_unimportant_pkts_fb.second == 0 || m_txBuffer->HeadSequence() > m_tlt_unimportant_pkts_fb.first)) {
+      // std::cerr << "WARNING : No Data to Force Retransmit : Must not reach here!!" << std::endl;
+      std::cerr << "WARNING : No Data to Force Retransmit : Recovered here!! - selecting any first packet in the window" << std::endl;
+      std::cerr << "Data here : m_tlt_unimportant_pkts_fb=" << m_tlt_unimportant_pkts_fb.first.GetValue() << " (" << m_tlt_unimportant_pkts_fb.second << ") head=" <<
+      m_txBuffer->HeadSequence().GetValue() << ", SocketId=" << socketId << ", snddst=" << host_src << "->" << host_dst <<", cwnd=" << m_tcb->m_cWnd << ", has_transmitted_uimp?" << m_tlt_unimportant_flag_debug << std::endl;
+      
+      m_tlt_unimportant_pkts.push(m_txBuffer->HeadSequence(), 1);
+      // abort();
+      // return false;
+    } 
+    else if (m_tlt_unimportant_pkts.size() == 0) {
+      std::cerr << "WARNING : No Data to Force Retransmit : Recovered here!!" << std::endl;
+      std::cerr << "HeadSeq = " << m_txBuffer->HeadSequence() << ", but fallbackseq = " << m_tlt_unimportant_pkts_fb.first << std::endl;
+      std::cerr << "Data here : m_tlt_unimportant_pkts_fb=" << m_tlt_unimportant_pkts_fb.first.GetValue() << " (" << m_tlt_unimportant_pkts_fb.second << ") head=" <<
+      m_txBuffer->HeadSequence().GetValue() << ", SocketId=" << socketId << ", snddst=" << host_src << "->" << host_dst <<", cwnd=" << m_tcb->m_cWnd << ", has_transmitted_uimp?" << m_tlt_unimportant_flag_debug << std::endl;
+      
+      m_tlt_unimportant_pkts.push(m_tlt_unimportant_pkts_fb.first, 1);
+    }
+  }
+  
+  NS_ASSERT(m_tlt_unimportant_pkts.size() > 0);
+
+  // first packet as unimportant
+  auto targetPair = m_tlt_unimportant_pkts.peek(GetSegSize());
+  SequenceNumber32 targetSeq = targetPair.first;
+  uint32_t targetSz = targetPair.second;
+  
+	if (!(availSz = m_txBuffer->SizeFromSequence(targetSeq)) || !targetSz) {
+		NS_LOG_INFO("No Data to Force Retransmit");
+		return false;
+	}
+
+  availSz = std::min(availSz, targetSz);
+
+  if(OPTIMIZE_LEVEL(2)) {
+    if(targetSeq.GetValue() + targetSz >= targetLen) {
+      // Last byte of flow retransmission
+      std::cerr << "Optimize 2, no immediate retransmit : Flowid = "  << socketId << std::endl;
+      return false;
+    }
+  }
+
+	// Quit if send disallowed
+	if (m_shutdownSend) {
+		m_errno = ERROR_SHUTDOWN;
+		return false;
+	}
+
+  if (OPTIMIZE_LEVEL(7) || OPTIMIZE_LEVEL(8)) {
+    uint32_t actualSz = std::min(tlt_send_unit, availSz);
+    if(m_tlt_unimportant_pkts.size() == 1) {
+        m_tlt_unimportant_pkts_fb = std::pair<SequenceNumber32, uint32_t>(targetSeq, actualSz);
+    }
+    m_tlt_unimportant_pkts.pop(actualSz); // assume queue not modified between peek and pop
+    
+    NS_ASSERT(m_PendingImportant == ImpPendingNormal);
+    uint32_t sz = SendDataPacket(targetSeq, std::min(tlt_send_unit, targetSz), true, false, true);
+    if(pSize)
+      *pSize = sz;
+    NS_ASSERT(m_PendingImportant == ImpIdle);
+    stat_uimp_forcegen += sz;
+    stat_uimp_forcegen_cnt++;
+    if (sz > 0)
+    {
+      nPacketsSent++;
+    }
+  } else if (OPTIMIZE_LEVEL(10)) {
+    uint32_t tlt_su = (m_tcb->m_congState == TcpSocketState::CA_RECOVERY) ? GetSegSize() : 1;
+    uint32_t actualSz = std::min(tlt_su, availSz);
+    if(m_tlt_unimportant_pkts.size() == 1) {
+        m_tlt_unimportant_pkts_fb = std::pair<SequenceNumber32, uint32_t>(targetSeq, actualSz);
+    }
+    m_tlt_unimportant_pkts.pop(actualSz); // assume queue not modified between peek and pop
+    
+    NS_ASSERT(m_PendingImportant == ImpPendingNormal);
+    uint32_t sz = SendDataPacket(targetSeq, std::min(tlt_su, targetSz), true, false, true);
+    if(pSize)
+      *pSize = sz;
+    NS_ASSERT(m_PendingImportant == ImpIdle);
+    stat_uimp_forcegen += sz;
+    stat_uimp_forcegen_cnt++;
+    if (sz > 0) {
+      nPacketsSent++;
+    }
+  } else if (OPTIMIZE_LEVEL(11)) {
+    bool is_loss_probable = !(m_tlt_unimportant_pkts_prev_round->isEmpty() && m_tlt_unimportant_pkts_prev_round->isDirty());
+
+    uint32_t tlt_su = is_loss_probable ? GetSegSize() : 1;
+    /* For Figure only */
+    if(OPTIMIZE_LEVEL(12))
+      tlt_su = GetSegSize();
+    else if (OPTIMIZE_LEVEL(13))
+      tlt_su = 1;
+
+    if (is_loss_probable && (m_tcb->m_congState != TcpSocketState::CA_RECOVERY)) {
+      experienced_tlt_loss_masking = true;
+      numExperienceLossMasking++;
+    }
+      
+    uint32_t actualSz = std::min(tlt_su, availSz);
+
+    if(!m_tlt_unimportant_pkts_prev_round->isEmpty()) {
+      auto ret = m_tlt_unimportant_pkts_prev_round->pop(actualSz);
+      targetSeq = ret.first;
+      actualSz = ret.second;
+      NS_ASSERT(targetSeq >= m_txBuffer->HeadSequence());
+      m_tlt_unimportant_pkts.discard(targetSeq, actualSz);
+      m_tlt_unimportant_pkts_current_round->discard(targetSeq, actualSz);
+    } else {
+    auto ret = m_tlt_unimportant_pkts.pop(actualSz); // assume queue not modified between peek and pop
+      NS_ABORT_UNLESS(targetSeq == ret.first);
+      NS_ABORT_UNLESS(actualSz == ret.second);
+    m_tlt_unimportant_pkts_prev_round->discard(targetSeq, actualSz);
+    m_tlt_unimportant_pkts_current_round->discard(targetSeq, actualSz);
+    }
+    
+    
+    // std::cout << actualSz << std::endl;
+
+    // NS_ABORT_IF()
+    // auto ret = m_tlt_unimportant_pkts.pop(actualSz); // assume queue not modified between peek and pop
+    // m_tlt_unimportant_pkts_prev_round->discard(targetSeq, actualSz);
+    // m_tlt_unimportant_pkts_current_round->discard(targetSeq, actualSz);
+    
+    // NS_ASSERT(ret.first == targetSeq);
+    NS_ASSERT(m_PendingImportant == ImpPendingNormal);
+    uint32_t sz = SendDataPacket(targetSeq, actualSz, true, false, true);
+    if(pSize)
+      *pSize = sz;
+    NS_ASSERT(m_PendingImportant == ImpIdle);
+    stat_uimp_forcegen += sz;
+    stat_uimp_forcegen_cnt++;
+    if (sz > 0) {
+      nPacketsSent++;
+    }
+    
+  } else if (OPTIMIZE_LEVEL(1)) {
+    if(m_tlt_unimportant_pkts.size() == 1) {
+        m_tlt_unimportant_pkts_fb = std::pair<SequenceNumber32, uint32_t>(targetSeq, 1);
+    }
+    m_tlt_unimportant_pkts.pop(1); // assume queue not modified between peek and pop
+    
+    NS_ASSERT(m_PendingImportant == ImpPendingNormal);
+    uint32_t sz = SendDataPacket(targetSeq, 1, true, false, true);
+    if(pSize)
+      *pSize = sz;
+  
+    NS_ASSERT(m_PendingImportant == ImpIdle);
+    stat_uimp_forcegen += sz;
+    stat_uimp_forcegen_cnt++;
+    if (sz > 0) {
+      nPacketsSent++;
+    }
+  } else {
+    // don't have to compare with MSS. (already will be limited)
+    if(m_tlt_unimportant_pkts.size() == 1) {
+        m_tlt_unimportant_pkts_fb = std::pair<SequenceNumber32, uint32_t>(targetSeq, 1);
+    }
+    m_tlt_unimportant_pkts.pop(1); // assume queue not modified between peek and pop
+    
+    NS_ASSERT(m_PendingImportant == ImpPendingNormal);
+    uint32_t sz = SendDataPacket(targetSeq, 1, true, false, true);
+    if(pSize)
+      *pSize = sz;
+  
+    NS_ASSERT(m_PendingImportant == ImpIdle);
+    stat_uimp_forcegen += sz;
+    stat_uimp_forcegen_cnt++;
+    if (sz > 0) {
+      nPacketsSent++;
+    }
+  }
+
+	//NS_LOG_WARN("forceSendTLT sent " << nPacketsSent << " packets, nextTx=" << m_nextTxSequence << ", highTx=" << m_highTxMark << ", Head=" << m_txBuffer.HeadSequence());
+	return (nPacketsSent > 0);
+  //#endif
 }
 
 //RttHistory methods

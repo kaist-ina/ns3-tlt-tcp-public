@@ -61,7 +61,7 @@ TcpSocket::GetTypeId (void)
                    MakeUintegerChecker<uint32_t> ())
     .AddAttribute ("SegmentSize",
                    "TCP maximum segment size in bytes (may be adjusted based on MTU discovery)",
-                   UintegerValue (536),
+                   UintegerValue (1440),
                    MakeUintegerAccessor (&TcpSocket::GetSegSize,
                                          &TcpSocket::SetSegSize),
                    MakeUintegerChecker<uint32_t> ())
@@ -73,7 +73,7 @@ TcpSocket::GetTypeId (void)
                    MakeUintegerChecker<uint32_t> ())
     .AddAttribute ("InitialCwnd",
                    "TCP initial congestion window size (segments)",
-                   UintegerValue (1),
+                   UintegerValue (10),
                    MakeUintegerAccessor (&TcpSocket::GetInitialCwnd,
                                          &TcpSocket::SetInitialCwnd),
                    MakeUintegerChecker<uint32_t> ())
@@ -86,25 +86,25 @@ TcpSocket::GetTypeId (void)
     .AddAttribute ("ConnCount",
                    "Number of connection attempts (SYN retransmissions) before "
                    "returning failure",
-                   UintegerValue (6),
+                   UintegerValue (10000),
                    MakeUintegerAccessor (&TcpSocket::GetSynRetries,
                                          &TcpSocket::SetSynRetries),
                    MakeUintegerChecker<uint32_t> ())
     .AddAttribute ("DataRetries",
                    "Number of data retransmission attempts",
-                   UintegerValue (6),
+                   UintegerValue (10000),
                    MakeUintegerAccessor (&TcpSocket::GetDataRetries,
                                          &TcpSocket::SetDataRetries),
                    MakeUintegerChecker<uint32_t> ())
     .AddAttribute ("DelAckTimeout",
                    "Timeout value for TCP delayed acks, in seconds",
-                   TimeValue (Seconds (0.2)),
+                   TimeValue (MilliSeconds (200)),
                    MakeTimeAccessor (&TcpSocket::GetDelAckTimeout,
                                      &TcpSocket::SetDelAckTimeout),
                    MakeTimeChecker ())
     .AddAttribute ("DelAckCount",
                    "Number of packets to wait before sending a TCP ack",
-                   UintegerValue (2),
+                   UintegerValue (1),
                    MakeUintegerAccessor (&TcpSocket::GetDelAckMaxCount,
                                          &TcpSocket::SetDelAckMaxCount),
                    MakeUintegerChecker<uint32_t> ())

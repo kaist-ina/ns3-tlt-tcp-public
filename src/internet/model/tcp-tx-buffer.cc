@@ -236,7 +236,7 @@ TcpTxBuffer::CopyFromSequence (uint32_t numBytes, const SequenceNumber32& seq)
       // already sent this block completely
       outItem = GetTransmittedSegment (s, seq);
       NS_ASSERT (outItem != nullptr);
-      NS_ASSERT (!outItem->m_sacked);
+      //NS_ASSERT (!outItem->m_sacked);
 
       NS_LOG_DEBUG ("Returning already sent item " << *outItem << " from " << *this);
     }
@@ -342,7 +342,7 @@ TcpTxBuffer::GetTransmittedSegment (uint32_t numBytes, const SequenceNumber32 &s
     }
 
   TcpTxItem *item = GetPacketFromList (m_sentList, m_firstByteSeq, s, seq, &listEdited);
-
+  m_highestSack = FindHighestSacked ();
   if (! item->m_retrans)
     {
       m_retrans += item->m_packet->GetSize ();

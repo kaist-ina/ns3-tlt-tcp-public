@@ -37,7 +37,7 @@ QueueBase::GetTypeId (void)
     .SetGroupName ("Network")
     .AddAttribute ("MaxSize",
                    "The max queue size",
-                   QueueSizeValue (QueueSize ("100p")),
+                   QueueSizeValue (QueueSize ("10000p")),
                    MakeQueueSizeAccessor (&QueueBase::SetMaxSize,
                                           &QueueBase::GetMaxSize),
                    MakeQueueSizeChecker ())

@@ -109,7 +109,7 @@ public:
    * \param ch Ptr to the channel to which this object is being attached.
    * \return true if the operation was successful (always true actually)
    */
-  bool Attach (Ptr<PointToPointChannel> ch);
+  virtual bool Attach (Ptr<PointToPointChannel> ch);
 
   /**
    * Attach a queue to the PointToPointNetDevice.
@@ -119,14 +119,14 @@ public:
    *
    * \param queue Ptr to the new queue.
    */
-  void SetQueue (Ptr<Queue<Packet> > queue);
+  virtual void SetQueue (Ptr<Queue<Packet>> queue);
 
   /**
    * Get a copy of the attached Queue.
    *
    * \returns Ptr to the queue.
    */
-  Ptr<Queue<Packet> > GetQueue (void) const;
+  virtual Ptr<Queue<Packet>> GetQueue (void) const;
 
   /**
    * Attach a receive ErrorModel to the PointToPointNetDevice.
@@ -223,19 +223,20 @@ private:
    */
   PointToPointNetDevice (const PointToPointNetDevice &o);
 
+protected:
   /**
    * \brief Dispose of the object
    */
   virtual void DoDispose (void);
 
-private:
 
   /**
    * \returns the address of the remote device connected to this device
    * through the point to point channel.
    */
-  Address GetRemote (void) const;
+  virtual Address GetRemote (void) const;
 
+protected:
   /**
    * Adds the necessary headers and trailers to a packet of data in order to
    * respect the protocol implemented by the agent.
@@ -269,7 +270,7 @@ private:
    * \param p a reference to the packet to send
    * \returns true if success, false on failure
    */
-  bool TransmitStart (Ptr<Packet> p);
+  virtual bool TransmitStart (Ptr<Packet> p);
 
   /**
    * Stop Sending a Packet Down the Wire and Begin the Interframe Gap.
@@ -277,7 +278,7 @@ private:
    * The TransmitComplete method is used internally to finish the process
    * of sending a packet out on the channel.
    */
-  void TransmitComplete (void);
+  virtual void TransmitComplete (void);
 
   /**
    * \brief Make the link up and running
@@ -325,6 +326,7 @@ private:
    */
   Ptr<Queue<Packet> > m_queue;
 
+protected:
   /**
    * Error model for receive packet events
    */
@@ -438,6 +440,7 @@ private:
    */
   TracedCallback<Ptr<const Packet> > m_promiscSnifferTrace;
 
+protected:
   Ptr<Node> m_node;         //!< Node owning this NetDevice
   Ptr<NetDeviceQueueInterface> m_queueInterface;   //!< NetDevice queue interface
   Mac48Address m_address;   //!< Mac48Address of this NetDevice

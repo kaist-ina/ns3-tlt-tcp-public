@@ -20,8 +20,16 @@
 #define TCPCONGESTIONOPS_H
 
 #include "ns3/tcp-socket-state.h"
+#include "ns3/tcp-socket-base.h"
+#include "ns3/object.h"
+#include "ns3/timer.h"
+#include "ns3/sequence-number.h"
+
 
 namespace ns3 {
+
+class TcpSocketState;
+class TcpSocketBase;
 
 /**
  * \ingroup tcp
@@ -63,6 +71,21 @@ public:
    * \param other object to copy.
    */
   TcpCongestionOps (const TcpCongestionOps &other);
+
+  // CA EVENT
+  /*typedef enum
+  {
+    CA_EVENT_ECN_IS_CE,
+    CA_EVENT_ECN_NO_CE,
+    CA_EVENT_DELAY_ACK_RESERVED,
+    CA_EVENT_DELAY_ACK_NO_RESERVED,
+    CA_EVENT_COMPLETE_CWR,
+    CA_EVENT_TX_START,
+    CA_EVENT_NON_DELAYED_ACK,
+    CA_EVENT_DELAYED_ACK,
+    CA_EVENT_LOSS,
+    CA_EVENT_LAST_EVENT
+  } TcpCongEvent_t;*/
 
   virtual ~TcpCongestionOps ();
 
@@ -123,6 +146,11 @@ public:
     NS_UNUSED (rtt);
   }
 
+  virtual void PktsAcked (Ptr<TcpSocketState> tcb, uint32_t segmentsAcked,
+        const Time &rtt, bool withECE, SequenceNumber32 highTxMark, SequenceNumber32 ackNumber)  {
+    PktsAcked(tcb, segmentsAcked, rtt);
+  }
+
   /**
    * \brief Trigger events/calculations specific to a congestion state
    *
@@ -148,12 +176,18 @@ public:
    * \param tcb internal congestion state
    * \param event the event which triggered this function
    */
+  
+                          
   virtual void CwndEvent (Ptr<TcpSocketState> tcb,
-                          const TcpSocketState::TcpCAEvent_t event)
+                          TcpSocketState::TcpCAEvent_t event, Ptr<TcpSocketBase> socket);
+
+                          
+  virtual void CwndEvent (Ptr<TcpSocketState> tcb,
+                          TcpSocketState::TcpCAEvent_t event)
   {
-    NS_UNUSED (tcb);
-    NS_UNUSED (event);
+    CwndEvent(tcb, event, nullptr);                    
   }
+                          
   // Present in Linux but not in ns-3 yet:
   /* call when ack arrives (optional) */
   // void (*in_ack_event)(struct sock *sk, u32 flags);
@@ -161,12 +195,18 @@ public:
   // u32  (*undo_cwnd)(struct sock *sk);
   /* hook for packet ack accounting (optional) */
 
+
+  // TODO this function would be called only if the state goes into CA_CWR
+  virtual uint32_t GetCwnd(Ptr<TcpSocketState> tcb);
+
   /**
    * \brief Copy the congestion control algorithm across socket
    *
    * \return a pointer of the copied object
    */
   virtual Ptr<TcpCongestionOps> Fork () = 0;
+
+  virtual void SendEmptyPacket (Ptr<TcpSocketBase> socket, uint32_t flag);
 };
 
 /**

@@ -1,0 +1,47 @@
+# Prerequisites
+*.d
+
+# Compiled Object files
+*.slo
+*.lo
+*.o
+*.obj
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Compiled Dynamic libraries
+*.so
+*.dylib
+*.dll
+
+# Fortran module files
+*.mod
+*.smod
+
+# Compiled Static libraries
+*.lai
+*.la
+*.a
+*.lib
+
+# Executables
+*.exe
+*.out
+*.app
+
+build/**
+
+.waf*
+*.pyc
+.lock-waf*
+workloads/cachefollower.txt
+workloads/mining.txt
+workloads/search.txt
+workloads/webserver.txt
+workloads/workload_cachefollower.tcl
+workloads/workload_mining.tcl
+workloads/workload_search.tcl
+workloads/workload_small.tcl
+workloads/workload_webserver.tcl

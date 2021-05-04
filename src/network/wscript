@@ -23,6 +23,7 @@ def build(bld):
         'model/tag.cc',
         'model/tag-buffer.cc',
         'model/trailer.cc',
+        'model/broadcom-node.cc',
         'utils/address-utils.cc',
         'utils/ascii-file.cc',
         'utils/crc32.cc',
@@ -64,6 +65,7 @@ def build(bld):
         'utils/packet-data-calculators.cc',
         'utils/packet-probe.cc',
         'utils/mac8-address.cc',
+        'utils/pfc-experience-tag.cc',
         'helper/application-container.cc',
         'helper/net-device-container.cc',
         'helper/node-container.cc',
@@ -71,6 +73,7 @@ def build(bld):
         'helper/trace-helper.cc',
         'helper/delay-jitter-estimation.cc',
         'helper/simple-net-device-helper.cc',
+        'model/tcp-flow-id-tag.cc'
         ]
 
     network_test = bld.create_ns3_module_test_library('network')
@@ -156,13 +159,16 @@ def build(bld):
         'utils/packet-data-calculators.h',
         'utils/packet-probe.h',
         'utils/mac8-address.h',
+        'utils/pfc-experience-tag.h',
         'helper/application-container.h',
         'helper/net-device-container.h',
         'helper/node-container.h',
         'helper/packet-socket-helper.h',
         'helper/trace-helper.h',
+        'model/tcp-flow-id-tag.h',
         'helper/delay-jitter-estimation.h',
         'helper/simple-net-device-helper.h',
+        'model/broadcom-node.h'
         ]
 
     if (bld.env['ENABLE_EXAMPLES']):

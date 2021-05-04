@@ -27,6 +27,7 @@
 #include "ns3/callback.h"
 #include "ns3/ptr.h"
 #include "ns3/net-device.h"
+#include "ns3/broadcom-node.h"
 
 namespace ns3 {
 
@@ -209,6 +210,12 @@ public:
    */
   static bool ChecksumEnabled (void);
 
+  //yibo
+  Ptr<BroadcomNode> m_broadcom;
+  void SetNodeType(uint32_t type, bool dynamicth);
+  void SetNodeType(uint32_t type);
+  uint32_t GetNodeType();
+
 
 protected:
   /**
@@ -284,6 +291,8 @@ private:
 
   uint32_t    m_id;         //!< Node id for this node
   uint32_t    m_sid;        //!< System id for this node
+  // yibo
+	uint32_t m_node_type;
   std::vector<Ptr<NetDevice> > m_devices; //!< Devices associated to this node
   std::vector<Ptr<Application> > m_applications; //!< Applications associated to this node
   ProtocolHandlerList m_handlers; //!< Protocol handlers in the node

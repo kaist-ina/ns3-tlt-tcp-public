@@ -44,6 +44,8 @@
 #include "tcp-congestion-ops.h"
 #include "tcp-recovery-ops.h"
 #include "rtt-estimator.h"
+#include "tcp-dctcp.h"
+#include "tlt-tag.h"
 
 #include <vector>
 #include <sstream>
@@ -90,6 +92,11 @@ TcpL4Protocol::GetTypeId (void)
                    ObjectVectorValue (),
                    MakeObjectVectorAccessor (&TcpL4Protocol::m_sockets),
                    MakeObjectVectorChecker<TcpSocketBase> ())
+	  .AddAttribute("TLT",
+		  "TLT Enabled Socket",
+		  BooleanValue(false),
+		  MakeBooleanAccessor(&TcpL4Protocol::m_TLT),
+		  MakeBooleanChecker())
   ;
   return tid;
 }
@@ -101,8 +108,37 @@ TcpL4Protocol::TcpL4Protocol ()
   NS_LOG_LOGIC ("Made a TcpL4Protocol " << this);
 }
 
+static uint64_t stat_tcp_imp = 0;
+static uint64_t stat_tcp_impe = 0;
+static uint64_t stat_tcp_impf = 0;
+static uint64_t stat_tcp_impfe = 0;
+static uint64_t stat_tcp_ctrl = 0;
+static uint64_t stat_tcp_uimp = 0;
+static uint64_t stat_tcp_imp_cnt = 0;
+static uint64_t stat_tcp_impe_cnt = 0;
+static uint64_t stat_tcp_impf_cnt = 0;
+static uint64_t stat_tcp_impfe_cnt = 0;
+static uint64_t stat_tcp_ctrl_cnt = 0;
+static uint64_t stat_tcp_uimp_cnt = 0;
+static bool stat_print = true;
+
 TcpL4Protocol::~TcpL4Protocol ()
 {
+  if(stat_print) {
+  		printf("%.8lf\tTCP_STAT_IMP\t%p\t%lu\n", Simulator::Now().GetSeconds(), this, stat_tcp_imp);
+  		printf("%.8lf\tTCP_STAT_IMPE\t%p\t%lu\n", Simulator::Now().GetSeconds(), this, stat_tcp_impe);
+  		printf("%.8lf\tTCP_STAT_IMPF\t%p\t%lu\n", Simulator::Now().GetSeconds(), this, stat_tcp_impf);
+  		printf("%.8lf\tTCP_STAT_IMPFE\t%p\t%lu\n", Simulator::Now().GetSeconds(), this, stat_tcp_impfe);
+  		printf("%.8lf\tTCP_STAT_CTRL\t%p\t%lu\n", Simulator::Now().GetSeconds(), this, stat_tcp_ctrl);
+  		printf("%.8lf\tTCP_STAT_UIMP\t%p\t%lu\n", Simulator::Now().GetSeconds(), this, stat_tcp_uimp);
+  		printf("%.8lf\tTCP_STAT_CNT_IMP\t%p\t%lu\n", Simulator::Now().GetSeconds(), this, stat_tcp_imp_cnt);
+  		printf("%.8lf\tTCP_STAT_CNT_IMPE\t%p\t%lu\n", Simulator::Now().GetSeconds(), this, stat_tcp_impe_cnt);
+  		printf("%.8lf\tTCP_STAT_CNT_IMPF\t%p\t%lu\n", Simulator::Now().GetSeconds(), this, stat_tcp_impf_cnt);
+  		printf("%.8lf\tTCP_STAT_CNT_IMPFE\t%p\t%lu\n", Simulator::Now().GetSeconds(), this, stat_tcp_impfe_cnt);
+  		printf("%.8lf\tTCP_STAT_CNT_CTRL\t%p\t%lu\n", Simulator::Now().GetSeconds(), this, stat_tcp_ctrl_cnt);
+  		printf("%.8lf\tTCP_STAT_CNT_UIMP\t%p\t%lu\n", Simulator::Now().GetSeconds(), this, stat_tcp_uimp_cnt);
+		  stat_print = false;
+		}
   NS_LOG_FUNCTION (this);
 }
 
@@ -551,10 +587,19 @@ TcpL4Protocol::Receive (Ptr<Packet> packet,
   return IpL4Protocol::RX_OK;
 }
 
-void
-TcpL4Protocol::SendPacketV4 (Ptr<Packet> packet, const TcpHeader &outgoing,
-                             const Ipv4Address &saddr, const Ipv4Address &daddr,
-                             Ptr<NetDevice> oif) const
+
+#define LAST_PACKET_BYTES (uint16_t)1
+static const Ipv4Header::DscpType DSCP_TLT_IMP = Ipv4Header::DSCP_AF11 ;
+static const Ipv4Header::DscpType DSCP_TLT_IMP_ECHO = Ipv4Header::DSCP_AF12;
+static const Ipv4Header::DscpType DSCP_TLT_IMP_FORCE = Ipv4Header::DSCP_AF21;
+static const Ipv4Header::DscpType DSCP_TLT_IMP_ECHO_FORCE = Ipv4Header::DSCP_AF22;
+static const Ipv4Header::DscpType DSCP_TLT_IMP_FAST_RETRANS = Ipv4Header::DSCP_AF31;
+static const Ipv4Header::DscpType DSCP_TLT_IMP_CONTROL = Ipv4Header::DSCP_AF32;
+static const Ipv4Header::DscpType DSCP_TLT_UIMP = Ipv4Header::DSCP_CS1;
+
+void TcpL4Protocol::SendPacketV4(Ptr<Packet> packet, const TcpHeader &outgoing,
+                                 const Ipv4Address &saddr, const Ipv4Address &daddr,
+                                 Ptr<NetDevice> oif) const
 {
   NS_LOG_FUNCTION (this << packet << saddr << daddr << oif);
   NS_LOG_LOGIC ("TcpL4Protocol " << this
@@ -584,6 +629,53 @@ TcpL4Protocol::SendPacketV4 (Ptr<Packet> packet, const TcpHeader &outgoing,
       header.SetDestination (daddr);
       header.SetProtocol (PROT_NUMBER);
       Socket::SocketErrno errno_;
+      if (m_TLT) {
+		    TltTag tlt;
+        SocketIpTosTag ipTosTag;
+        packet->RemovePacketTag (ipTosTag);
+        uint8_t tos = ipTosTag.GetTos();
+        if(packet->PeekPacketTag(tlt)) {
+				  if (tlt.GetType() == TltTag::PACKET_IMPORTANT) {
+					  tos = (tos & 0x03) | ((DSCP_TLT_IMP<<2) & (~0x03));
+            stat_tcp_imp += packet->GetSize();
+            stat_tcp_imp_cnt++;
+          }
+          else if (tlt.GetType() == TltTag::PACKET_IMPORTANT_ECHO) {
+            tos = (tos & 0x03) | ((DSCP_TLT_IMP_ECHO<<2) & (~0x03));
+            stat_tcp_impe += packet->GetSize();
+            stat_tcp_impe_cnt++;
+				  } else if (tlt.GetType() == TltTag::PACKET_IMPORTANT_FORCE){
+					  tos = (tos & 0x03) | ((DSCP_TLT_IMP_FORCE<<2) & (~0x03));
+            stat_tcp_impf += packet->GetSize();
+            stat_tcp_impf_cnt++;
+				  } else if (tlt.GetType() == TltTag::PACKET_IMPORTANT_ECHO_FORCE){
+					  tos = (tos & 0x03) | ((DSCP_TLT_IMP_ECHO_FORCE<<2) & (~0x03));
+            stat_tcp_impfe += packet->GetSize();
+            stat_tcp_impfe_cnt++;
+				  } else if (tlt.GetType() == TltTag::PACKET_IMPORTANT_FAST_RETRANS){
+					  tos = (tos & 0x03) | ((DSCP_TLT_IMP_FAST_RETRANS<<2) & (~0x03));
+				  } else if (tlt.GetType() == TltTag::PACKET_IMPORTANT_CONTROL){
+					  tos = (tos & 0x03) | ((DSCP_TLT_IMP_CONTROL<<2) & (~0x03));
+            stat_tcp_ctrl += packet->GetSize();
+            stat_tcp_ctrl_cnt++;
+				  } else{
+					  tos = (tos & 0x03) | ((DSCP_TLT_UIMP<<2) & (~0x03));
+            stat_tcp_uimp += packet->GetSize();
+            stat_tcp_uimp_cnt++;
+            } 
+			  } else {
+				  tos = (tos & 0x03) | ((DSCP_TLT_UIMP<<2) & (~0x03));
+          stat_tcp_uimp += packet->GetSize();
+				  tlt.SetType(TltTag::PACKET_NOT_IMPORTANT);
+				  packet->AddPacketTag(tlt);
+			  }
+
+        ipTosTag.SetTos(tos);
+        packet->AddPacketTag (ipTosTag);
+      } else {
+          stat_tcp_uimp += packet->GetSize();
+      }
+
       Ptr<Ipv4Route> route;
       if (ipv4->GetRoutingProtocol () != 0)
         {

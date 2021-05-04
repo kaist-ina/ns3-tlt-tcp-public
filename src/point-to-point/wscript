@@ -2,13 +2,21 @@
 
 
 def build(bld):
-    module = bld.create_ns3_module('point-to-point', ['network', 'mpi'])
+    module = bld.create_ns3_module('point-to-point', ['network', 'mpi', 'broadcom', 'applications'])
     module.source = [
         'model/point-to-point-net-device.cc',
         'model/point-to-point-channel.cc',
         'model/point-to-point-remote-channel.cc',
         'model/ppp-header.cc',
         'helper/point-to-point-helper.cc',
+        'model/cn-header.cc',
+        'model/irn-header.cc',
+        'model/pause-header.cc',
+        'model/qbb-channel.cc',
+        'model/qbb-header.cc',
+        'model/qbb-net-device.cc',
+        'helper/qbb-helper.cc',
+        'model/qbb-remote-channel.cc'
         ]
 
     module_test = bld.create_ns3_module_test_library('point-to-point')
@@ -24,6 +32,15 @@ def build(bld):
         'model/point-to-point-remote-channel.h',
         'model/ppp-header.h',
         'helper/point-to-point-helper.h',
+        
+        'model/cn-header.h',
+        'model/irn-header.h',
+        'model/pause-header.h',
+        'model/qbb-channel.h',
+        'model/qbb-header.h',
+        'model/qbb-net-device.h',
+        'helper/qbb-helper.h',
+        'model/qbb-remote-channel.h'
         ]
 
     if (bld.env['ENABLE_EXAMPLES']):

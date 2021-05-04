@@ -77,7 +77,8 @@ Node::GetTypeId (void)
 
 Node::Node()
   : m_id (0),
-    m_sid (0)
+    m_sid (0),
+    m_node_type (0)
 {
   NS_LOG_FUNCTION (this);
   Construct ();
@@ -367,5 +368,37 @@ Node::NotifyDeviceAdded (Ptr<NetDevice> device)
     }  
 }
  
+ //yibo
+void 
+Node::SetNodeType(uint32_t type, bool dynamicth)
+{
+	m_node_type = type;
+	if (type==1)
+	{
+		m_broadcom = CreateObject<BroadcomNode>();
+		if (dynamicth)
+		{
+			m_broadcom->SetDynamicThreshold();
+		}
+	}
+}
+
+void 
+Node::SetNodeType(uint32_t type)
+{
+	m_node_type = type;
+	if (type==1)
+	{
+		m_broadcom = CreateObject<BroadcomNode>();
+	}
+}
+
+uint32_t 
+Node::GetNodeType()
+{
+	return m_node_type;
+}
+
+
 
 } // namespace ns3

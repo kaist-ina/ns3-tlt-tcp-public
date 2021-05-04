@@ -122,7 +122,7 @@ void PacketSink::StartApplication ()    // Called at time specified by Start
           NS_FATAL_ERROR ("Failed to bind socket");
         }
       m_socket->Listen ();
-      m_socket->ShutdownSend ();
+      // m_socket->ShutdownSend ();
       if (addressUtils::IsMulticast (m_local))
         {
           Ptr<UdpSocket> udpSocket = DynamicCast<UdpSocket> (m_socket);

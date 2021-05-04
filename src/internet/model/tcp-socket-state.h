@@ -96,6 +96,8 @@ public:
     CA_EVENT_ECN_IS_CE,    /**< received CE marked IP packet. Not triggered */
     CA_EVENT_DELAYED_ACK,  /**< Delayed ack is sent */
     CA_EVENT_NON_DELAYED_ACK, /**< Non-delayed ack is sent */
+    CA_EVENT_DELAY_ACK_RESERVED,
+    CA_EVENT_DELAY_ACK_NO_RESERVED
   } TcpCAEvent_t;
 
    /**
@@ -153,6 +155,14 @@ public:
 
   TracedValue<uint32_t>  m_bytesInFlight {0};        //!< Bytes in flight
   TracedValue<Time>      m_lastRtt {Seconds (0.0)};  //!< Last RTT sample collected
+
+  // ECN support
+  TracedValue<bool>      m_ecnConn;         //!< Whether the TCP connection is ECN capable
+  TracedValue<bool>      m_ecnSeen;         //!< Whether ECN mark has been appeared through the communication
+  TracedValue<bool>      m_demandCWR;       //!< The receiver demands the sender to send the CWR by sending ECE ACK
+  TracedValue<bool>      m_queueCWR;        //!< The congestion ops has responded, ready to send the CWR code point
+  TracedValue<bool>      m_sentCWR;         //!< The CWR has sent indicating the CWRSentSeq has been set
+  TracedValue<SequenceNumber32> m_CWRSentSeq;   //!< The CWR seq is marked down to indicate when to exit the CA_CWR
 
   /**
    * \brief Get cwnd in segments rather than bytes

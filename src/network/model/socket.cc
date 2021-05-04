@@ -22,6 +22,7 @@
 
 #include "ns3/log.h"
 #include "ns3/packet.h"
+#include "ns3/simulator.h"
 #include "node.h"
 #include "socket.h"
 #include "socket-factory.h"
@@ -115,6 +116,9 @@ Socket::SetDataSentCallback (Callback<void, Ptr<Socket>, uint32_t> dataSent)
 {
   NS_LOG_FUNCTION (this << &dataSent);
   m_dataSent = dataSent;
+  
+  if(!firstUsed.GetMicroSeconds()) firstUsed = Simulator::Now();
+  lastUsed = Simulator::Now();
 }
 
 void
@@ -122,6 +126,9 @@ Socket::SetSendCallback (Callback<void, Ptr<Socket>, uint32_t> sendCb)
 {
   NS_LOG_FUNCTION (this << &sendCb);
   m_sendCb = sendCb;
+  
+  if(!firstUsed.GetMicroSeconds()) firstUsed = Simulator::Now();
+  lastUsed = Simulator::Now();
 }
 
 void 
@@ -135,6 +142,8 @@ int
 Socket::Send (Ptr<Packet> p)
 {
   NS_LOG_FUNCTION (this << p);
+  if(!firstUsed.GetMicroSeconds()) firstUsed = Simulator::Now();
+  lastUsed = Simulator::Now();
   return Send (p, 0);
 }
 
@@ -142,6 +151,8 @@ int
 Socket::Send (const uint8_t* buf, uint32_t size, uint32_t flags)
 {
   NS_LOG_FUNCTION (this << &buf << size << flags);
+  if(!firstUsed.GetMicroSeconds()) firstUsed = Simulator::Now();
+  lastUsed = Simulator::Now();
   Ptr<Packet> p;
   if (buf)
     {
@@ -159,6 +170,8 @@ Socket::SendTo (const uint8_t* buf, uint32_t size, uint32_t flags,
                 const Address &toAddress)
 {
   NS_LOG_FUNCTION (this << &buf << size << flags << &toAddress);
+  if(!firstUsed.GetMicroSeconds()) firstUsed = Simulator::Now();
+  lastUsed = Simulator::Now();
   Ptr<Packet> p;
   if(buf)
     {
@@ -175,6 +188,8 @@ Ptr<Packet>
 Socket::Recv (void)
 {
   NS_LOG_FUNCTION (this);
+  if(!firstUsed.GetMicroSeconds()) firstUsed = Simulator::Now();
+  lastUsed = Simulator::Now();
   return Recv (std::numeric_limits<uint32_t>::max (), 0);
 }
 
@@ -182,6 +197,8 @@ int
 Socket::Recv (uint8_t* buf, uint32_t size, uint32_t flags)
 {
   NS_LOG_FUNCTION (this << &buf << size << flags);
+  if(!firstUsed.GetMicroSeconds()) firstUsed = Simulator::Now();
+  lastUsed = Simulator::Now();
   Ptr<Packet> p = Recv (size, flags); // read up to "size" bytes
   if (p == 0)
     {
@@ -195,6 +212,8 @@ Ptr<Packet>
 Socket::RecvFrom (Address &fromAddress)
 {
   NS_LOG_FUNCTION (this << &fromAddress);
+  if(!firstUsed.GetMicroSeconds()) firstUsed = Simulator::Now();
+  lastUsed = Simulator::Now();
   return RecvFrom (std::numeric_limits<uint32_t>::max (), 0, fromAddress);
 }
 
@@ -203,6 +222,8 @@ Socket::RecvFrom (uint8_t* buf, uint32_t size, uint32_t flags,
                   Address &fromAddress)
 {
   NS_LOG_FUNCTION (this << &buf << size << flags << &fromAddress);
+  if(!firstUsed.GetMicroSeconds()) firstUsed = Simulator::Now();
+  lastUsed = Simulator::Now();
   Ptr<Packet> p = RecvFrom (size, flags, fromAddress); 
   if (p == 0)
     {
@@ -217,6 +238,8 @@ void
 Socket::NotifyConnectionSucceeded (void)
 {
   NS_LOG_FUNCTION (this);
+  if(!firstUsed.GetMicroSeconds()) firstUsed = Simulator::Now();
+  lastUsed = Simulator::Now();
   if (!m_connectionSucceeded.IsNull ())
     {
       m_connectionSucceeded (this);
@@ -227,6 +250,8 @@ void
 Socket::NotifyConnectionFailed (void)
 {
   NS_LOG_FUNCTION (this);
+  if(!firstUsed.GetMicroSeconds()) firstUsed = Simulator::Now();
+  lastUsed = Simulator::Now();
   if (!m_connectionFailed.IsNull ())
     {
       m_connectionFailed (this);
@@ -237,6 +262,8 @@ void
 Socket::NotifyNormalClose (void)
 {
   NS_LOG_FUNCTION (this);
+  if(!firstUsed.GetMicroSeconds()) firstUsed = Simulator::Now();
+  lastUsed = Simulator::Now();
   if (!m_normalClose.IsNull ())
     {
       m_normalClose (this);
@@ -247,6 +274,8 @@ void
 Socket::NotifyErrorClose (void)
 {
   NS_LOG_FUNCTION (this);
+  if(!firstUsed.GetMicroSeconds()) firstUsed = Simulator::Now();
+  lastUsed = Simulator::Now();
   if (!m_errorClose.IsNull ())
     {
       m_errorClose (this);
@@ -257,6 +286,8 @@ bool
 Socket::NotifyConnectionRequest (const Address &from)
 {
   NS_LOG_FUNCTION (this << &from);
+  if(!firstUsed.GetMicroSeconds()) firstUsed = Simulator::Now();
+  lastUsed = Simulator::Now();
   if (!m_connectionRequest.IsNull ())
     {
       return m_connectionRequest (this, from);
@@ -275,6 +306,8 @@ void
 Socket::NotifyNewConnectionCreated (Ptr<Socket> socket, const Address &from)
 {
   NS_LOG_FUNCTION (this << socket << from);
+  if(!firstUsed.GetMicroSeconds()) firstUsed = Simulator::Now();
+  lastUsed = Simulator::Now();
   if (!m_newConnectionCreated.IsNull ())
     {
       m_newConnectionCreated (socket, from);
@@ -285,6 +318,8 @@ void
 Socket::NotifyDataSent (uint32_t size)
 {
   NS_LOG_FUNCTION (this << size);
+  if(!firstUsed.GetMicroSeconds()) firstUsed = Simulator::Now();
+  lastUsed = Simulator::Now();
   if (!m_dataSent.IsNull ())
     {
       m_dataSent (this, size);
@@ -295,6 +330,8 @@ void
 Socket::NotifySend (uint32_t spaceAvailable)
 {
   NS_LOG_FUNCTION (this << spaceAvailable);
+  if(!firstUsed.GetMicroSeconds()) firstUsed = Simulator::Now();
+  lastUsed = Simulator::Now();
   if (!m_sendCb.IsNull ())
     {
       m_sendCb (this, spaceAvailable);
@@ -305,6 +342,8 @@ void
 Socket::NotifyDataRecv (void)
 {
   NS_LOG_FUNCTION (this);
+  if(!firstUsed.GetMicroSeconds()) firstUsed = Simulator::Now();
+  lastUsed = Simulator::Now();
   if (!m_receivedData.IsNull ())
     {
       m_receivedData (this);
@@ -888,7 +927,7 @@ SocketPriorityTag::Deserialize (TagBuffer i)
 void
 SocketPriorityTag::Print (std::ostream &os) const
 {
-  os << "SO_PRIORITY = " << m_priority;
+  os << "SO_PRIORITY = " << (int)m_priority;
 }
 
 

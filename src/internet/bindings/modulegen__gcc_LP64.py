@@ -11371,7 +11371,7 @@ def register_Ns3TcpSocketBase_methods(root_module, cls):
     ## tcp-socket-base.h (module 'internet'): void ns3::TcpSocketBase::ProcessAck(ns3::SequenceNumber32 const & ackNumber, bool scoreboardUpdated, ns3::SequenceNumber32 const & oldHeadSequence) [member function]
     cls.add_method('ProcessAck', 
                    'void', 
-                   [param('ns3::SequenceNumber32 const &', 'ackNumber'), param('bool', 'scoreboardUpdated'), param('ns3::SequenceNumber32 const &', 'oldHeadSequence')], 
+                   [param('ns3::SequenceNumber32 const &', 'ackNumber'), param('bool', 'scoreboardUpdated'), param('ns3::SequenceNumber32 const &', 'oldHeadSequence'), param('bool', 'withECE')], 
                    visibility='protected', is_virtual=True)
     ## tcp-socket-base.h (module 'internet'): void ns3::TcpSocketBase::ProcessClosing(ns3::Ptr<ns3::Packet> packet, ns3::TcpHeader const & tcpHeader) [member function]
     cls.add_method('ProcessClosing', 

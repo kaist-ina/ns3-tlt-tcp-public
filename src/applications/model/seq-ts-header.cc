@@ -57,6 +57,18 @@ SeqTsHeader::GetTs (void) const
   return TimeStep (m_ts);
 }
 
+void
+SeqTsHeader::SetPG (uint16_t pg)
+{
+	m_pg = pg;
+}
+
+uint16_t
+SeqTsHeader::GetPG (void) const
+{
+	return m_pg;
+}
+
 TypeId
 SeqTsHeader::GetTypeId (void)
 {
@@ -76,13 +88,13 @@ void
 SeqTsHeader::Print (std::ostream &os) const
 {
   NS_LOG_FUNCTION (this << &os);
-  os << "(seq=" << m_seq << " time=" << TimeStep (m_ts).GetSeconds () << ")";
+  os << "(seq=" << m_seq << " time=" << TimeStep (m_ts).GetSeconds () << " pg=" << m_pg << ")";
 }
 uint32_t
 SeqTsHeader::GetSerializedSize (void) const
 {
   NS_LOG_FUNCTION (this);
-  return 4+8;
+  return 14;
 }
 
 void
@@ -92,6 +104,7 @@ SeqTsHeader::Serialize (Buffer::Iterator start) const
   Buffer::Iterator i = start;
   i.WriteHtonU32 (m_seq);
   i.WriteHtonU64 (m_ts);
+  i.WriteHtonU16 (m_pg);
 }
 uint32_t
 SeqTsHeader::Deserialize (Buffer::Iterator start)
@@ -100,6 +113,7 @@ SeqTsHeader::Deserialize (Buffer::Iterator start)
   Buffer::Iterator i = start;
   m_seq = i.ReadNtohU32 ();
   m_ts = i.ReadNtohU64 ();
+  m_pg =  i.ReadNtohU16 ();
   return GetSerializedSize ();
 }
 

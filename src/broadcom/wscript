@@ -1,0 +1,15 @@
+## -*- Mode: python; py-indent-offset: 4; indent-tabs-mode: nil; coding: utf-8; -*-
+
+def build(bld):
+    network = bld.create_ns3_module('broadcom', ['internet', 'network'])
+    network.source = [
+        'utils/broadcom-egress-queue.cc',
+    ]
+
+    headers = bld(features='ns3header')
+    headers.module = 'broadcom'
+    headers.source = [
+        'utils/broadcom-egress-queue.h'
+        ]
+
+    bld.ns3_python_bindings()

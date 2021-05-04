@@ -28,16 +28,23 @@
 #include "ns3/tag.h"
 #include "ns3/object.h"
 #include "ns3/net-device.h"
+#include "ns3/nstime.h"
 #include "address.h"
 #include <stdint.h>
 #include "ns3/inet-socket-address.h"
 #include "ns3/inet6-socket-address.h"
+#include "ns3/sequence-number.h"
 
 namespace ns3 {
 
 
 class Node;
 class Packet;
+
+enum FlowType
+{
+  UNKNOWN = 0, BACKGROUND_FLOW = 1, FOREGROUND_FLOW = 2
+};
 
 /**
  * \ingroup network
@@ -983,6 +990,20 @@ public:
    * \brief Leaves IPv6 multicast group this socket is joined to.
    */
   virtual void Ipv6LeaveGroup (void);
+
+  int32_t socketId {-1};
+  int32_t num_background_flow {-1};
+  FlowType socket_flow_type = UNKNOWN;
+  int host_src;
+  int host_dst;
+  Time firstUsed {Seconds(0)};
+  Time firstUsedTcp {Seconds(0)};
+  Time lastUsed {Seconds(0)};
+  Time lastUsedTcp {Seconds(0)};
+  SequenceNumber32 lastAckTcp {SequenceNumber32(0)};
+  uint32_t targetLen;
+  uint64_t PausedTimeStart{0};
+  int32_t remoteSocketId{-1};
 
 protected:
   /**

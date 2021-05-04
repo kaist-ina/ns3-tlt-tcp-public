@@ -133,7 +133,7 @@ TcpOptionTS::SetEcho (uint32_t ts)
 uint32_t
 TcpOptionTS::NowToTsValue ()
 {
-  uint64_t now = (uint64_t) Simulator::Now ().GetMilliSeconds ();
+  uint64_t now = (uint64_t) Simulator::Now ().GetNanoSeconds ();
 
   // high: (now & 0xFFFFFFFF00000000ULL) >> 32;
   // low: now & 0xFFFFFFFF
@@ -143,13 +143,13 @@ TcpOptionTS::NowToTsValue ()
 Time
 TcpOptionTS::ElapsedTimeFromTsValue (uint32_t echoTime)
 {
-  uint64_t now64 = (uint64_t) Simulator::Now ().GetMilliSeconds ();
+  uint64_t now64 = (uint64_t) Simulator::Now ().GetNanoSeconds ();
   uint32_t now32 = now64 & 0xFFFFFFFF;
 
   Time ret = Seconds (0.0);
   if (now32 > echoTime)
     {
-      ret = MilliSeconds (now32 - echoTime);
+      ret = NanoSeconds (now32 - echoTime);
     }
 
   return ret;

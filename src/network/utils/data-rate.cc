@@ -293,4 +293,45 @@ double operator* (const Time& lhs, const DataRate& rhs)
   return lhs.GetSeconds ()*rhs.GetBitRate ();
 }
 
+
+
+
+DataRate& DataRate::operator/=(const double& c)
+{
+	m_bps /= c;
+	return *this;
+};
+
+DataRate& DataRate::operator+=(const DataRate& r)
+{
+	m_bps += r.m_bps;
+	return *this;
+};
+
+DataRate operator*(const double& c, const DataRate& d)
+{
+	return DataRate(d.GetBitRate()*c);
+};
+
+DataRate operator*(const DataRate& d, const double& c)
+{
+	return DataRate(d.GetBitRate()*c);
+};
+
+DataRate operator/(const DataRate& d, const double& c)
+{
+	return DataRate(d.GetBitRate()/c);
+};
+
+double operator/(const DataRate& lhs, const DataRate& rhs)
+{
+	return double(lhs.GetBitRate())/rhs.GetBitRate();
+};
+
+DataRate operator+(const DataRate& lhs, const DataRate& rhs)
+{
+	return DataRate(lhs.GetBitRate()+rhs.GetBitRate());
+};
+
+
 } // namespace ns3

@@ -16,6 +16,7 @@ cpp_examples = [
     ("fifth", "True", "True"),
     ("sixth", "True", "True"),
     ("seventh", "True", "True"),
+    ("tlt-main", "True", "True"),
 ]
 
 # A list of Python examples to run in order to ensure that they remain

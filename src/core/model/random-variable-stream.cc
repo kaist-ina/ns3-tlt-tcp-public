@@ -417,7 +417,7 @@ ExponentialRandomVariable::GetValue (double mean, double bound)
         }
 
       // Calculate the exponential random variable.
-      double r = -mean*std::log (v);
+      double r = -mean*std::log (static_cast<double>(v));
 
       // Use this value if it's acceptable.
       if (bound == 0 || r <= bound)
@@ -630,7 +630,7 @@ WeibullRandomVariable::GetValue (double scale, double shape, double bound)
         }
 
       // Calculate the Weibull random variable.
-      double r = scale * std::pow ( -std::log (v), exponent);
+      double r = scale * std::pow ( -std::log (static_cast<double>(v)), exponent);
 
       // Use this value if it's acceptable.
       if (bound == 0 || r <= bound)
@@ -738,13 +738,13 @@ NormalRandomVariable::GetValue (double mean, double variance, double bound)
       double w = v1 * v1 + v2 * v2;
       if (w <= 1.0)
         { // Got good pair
-          double y = std::sqrt ((-2 * std::log (w)) / w);
-          m_next = mean + v2 * y * std::sqrt (variance);
+          double y = std::sqrt ((-2 * std::log (static_cast<double>(w))) / w);
+          m_next = mean + v2 * y * std::sqrt (static_cast<double>(variance));
           // if next is in bounds, it is valid
-          m_nextValid = std::fabs (m_next - mean) <= bound;
-          double x1 = mean + v1 * y * std::sqrt (variance);
+          m_nextValid = std::fabs (static_cast<double>(m_next - mean)) <= bound;
+          double x1 = mean + v1 * y * std::sqrt (static_cast<double>(variance));
           // if x1 is in bounds, return it
-          if (std::fabs (x1 - mean) <= bound)
+          if (std::fabs (static_cast<double>(x1 - mean)) <= bound)
             {
               return x1;
             }
